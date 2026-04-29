@@ -446,17 +446,47 @@ mod tax_compliance {
         verified: bool,
     }
 
-    #[ink(event)]
-    pub struct ComplianceRegistrySyncRequested {
-        #[ink(topic)]
-        property_id: u64,
-        #[ink(topic)]
-        jurisdiction_code: u32,
-        reporting_period: u64,
-        outstanding_tax: Balance,
-        legal_documents_verified: bool,
-        reporting_submitted: bool,
-    }
+#[ink(event)]
+pub struct ComplianceRegistrySyncRequested {
+    #[ink(topic)]
+    property_id: u64,
+    #[ink(topic)]
+    jurisdiction_code: u32,
+    reporting_period: u64,
+    outstanding_tax: Balance,
+    legal_documents_verified: bool,
+    reporting_submitted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum DeadlineAlertLevel {
+    Approaching,
+    Urgent,
+}
+
+#[ink(event)]
+pub struct TaxDeadlineApproaching {
+    #[ink(topic)]
+    property_id: u64,
+    #[ink(topic)]
+    jurisdiction_code: u32,
+    reporting_period: u64,
+    due_at: Timestamp,
+    days_remaining: u16,
+    alert_level: DeadlineAlertLevel,
+}
+
+#[ink(event)]
+pub struct TaxDeadlineNotification {
+    #[ink(topic)]
+    property_id: u64,
+    #[ink(topic)]
+    jurisdiction_code: u32,
+    reporting_period: u64,
+    due_at: Timestamp,
+    days_remaining: u16,
+}
 
     #[ink(event)]
     pub struct TaxDocumentUploaded {
@@ -794,6 +824,28 @@ mod tax_compliance {
                     tax_due: record.tax_due,
                 });
 
+                // Emit tax deadline notification if approaching
+                if let Some(days) = crate::tax_engine::days_until_due(now, record.due_at) {
+                    if days <= 30 {
+                        let alert_level = if days <= 7 { DeadlineAlertLevel::Urgent } else { DeadlineAlertLevel::Approaching };
+                        self.env().emit_event(TaxDeadlineApproaching {
+                            property_id,
+                            jurisdiction_code: jurisdiction.code,
+                            reporting_period,
+                            due_at: record.due_at,
+                            days_remaining: days,
+                            alert_level,
+                        });
+                        self.env().emit_event(TaxDeadlineNotification {
+                            property_id,
+                            jurisdiction_code: jurisdiction.code,
+                            reporting_period,
+                            due_at: record.due_at,
+                            days_remaining: days,
+                        });
+                    }
+                }
+
                 let snapshot = self.build_snapshot(
                     property_id,
                     jurisdiction.code,
@@ -996,6 +1048,30 @@ mod tax_compliance {
             non_reentrant!(self, {
                 let snapshot =
                     self.build_snapshot(property_id, jurisdiction.code, &rule, &assessment, record);
+
+                // Emit tax deadline notification if approaching during compliance check
+                if let Some(record) = record {
+                    if let Some(days) = crate::tax_engine::days_until_due(now, record.due_at) {
+                        if days <= 30 {
+                            let alert_level = if days <= 7 { DeadlineAlertLevel::Urgent } else { DeadlineAlertLevel::Approaching };
+                            self.env().emit_event(TaxDeadlineApproaching {
+                                property_id,
+                                jurisdiction_code: jurisdiction.code,
+                                reporting_period: record.reporting_period,
+                                due_at: record.due_at,
+                                days_remaining: days,
+                                alert_level,
+                            });
+                            self.env().emit_event(TaxDeadlineNotification {
+                                property_id,
+                                jurisdiction_code: jurisdiction.code,
+                                reporting_period: record.reporting_period,
+                                due_at: record.due_at,
+                                days_remaining: days,
+                            });
+                        }
+                    }
+                }
 
                 let mut outstanding_ref = [0u8; 32];
                 outstanding_ref[16..].copy_from_slice(&snapshot.outstanding_tax.to_be_bytes());

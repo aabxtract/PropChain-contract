@@ -117,3 +117,12 @@ pub(crate) fn resolve_status(record: TaxRecord, now: Timestamp) -> TaxStatus {
         TaxStatus::Assessed
     }
 }
+
+pub(crate) fn days_until_due(now: Timestamp, due_at: Timestamp) -> Option<u16> {
+    if due_at <= now {
+        return None;
+    }
+    let millis_per_day = 24 * 60 * 60 * 1000u64;
+    let days = ((due_at - now) / millis_per_day) as u16;
+    Some(days)
+}
