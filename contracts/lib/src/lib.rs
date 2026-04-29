@@ -110,6 +110,8 @@ pub mod propchain_contracts {
         InvalidRange,
         /// Reentrancy guard detected a reentrant call
         ReentrantCall,
+        /// External dependency is temporarily unavailable because its circuit breaker is open
+        ExternalDependencyUnavailable,
     }
 
     impl From<crate::ReentrancyError> for Error {
@@ -187,9 +189,83 @@ pub mod propchain_contracts {
         /// `identity_registry` fields for new code; those fields are kept for
         /// backward-compatibility with existing callers.
         deps: ContainerConfig,
+        /// Circuit breaker state per external dependency.
+        external_call_breakers: Mapping<ExternalDependency, CircuitBreakerState>,
+        /// Shared external call circuit breaker configuration.
+        external_call_config: CircuitBreakerConfig,
 
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum ExternalDependency {
+        FeeManager,
+        Oracle,
+        ComplianceRegistry,
+        IdentityRegistry,
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerState {
+        pub failure_count: u8,
+        pub total_failures: u64,
+        pub last_failure_at: Option<u64>,
+        pub open_until: Option<u64>,
+    }
+
+    impl Default for CircuitBreakerState {
+        fn default() -> Self {
+            Self {
+                failure_count: 0,
+                total_failures: 0,
+                last_failure_at: None,
+                open_until: None,
+            }
+        }
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerConfig {
+        pub failure_threshold: u8,
+        pub cooldown_period_secs: u64,
+    }
+
+    impl Default for CircuitBreakerConfig {
+        fn default() -> Self {
+            Self {
+                failure_threshold: 3,
+                cooldown_period_secs: 300,
+            }
+        }
     }
 
     /// Escrow information
@@ -1262,6 +1338,8 @@ pub mod propchain_contracts {
                     at
                 },
                 deps: ContainerConfig::new(),
+                external_call_breakers: Mapping::default(),
+                external_call_config: CircuitBreakerConfig::default(),
                 cached_analytics: CachedAnalytics::default(),
                 load_metrics: LoadMetrics::default(),
                 reentrancy_guard: ReentrancyGuard::new(),
@@ -1509,10 +1587,7 @@ pub mod propchain_contracts {
                 .unwrap_or_default()
         }
 
-        fn ensure_dependency_available(
-            &self,
-            dependency: ExternalDependency,
-        ) -> Result<(), Error> {
+        fn ensure_dependency_available(&self, dependency: ExternalDependency) -> Result<(), Error> {
             let state = self.circuit_state(dependency);
             if let Some(open_until) = state.open_until {
                 if self.env().block_timestamp() < open_until {
@@ -1637,6 +1712,7 @@ pub mod propchain_contracts {
         #[ink(message)]
         pub fn update_valuation_from_oracle(&mut self, property_id: u64) -> Result<(), Error> {
             non_reentrant!(self, {
+                self.ensure_dependency_available(ExternalDependency::Oracle)?;
                 let oracle_addr = self.oracle.ok_or(Error::OracleError)?;
 
                 // Use the Oracle trait to perform the cross-contract call
@@ -1645,9 +1721,13 @@ pub mod propchain_contracts {
                     FromAccountId::from_account_id(oracle_addr);
 
                 // Fetch valuation from oracle
-                let valuation = oracle
-                    .get_valuation(property_id)
-                    .map_err(|_| Error::OracleError)?;
+                let valuation = match oracle.get_valuation(property_id) {
+                    Ok(valuation) => valuation,
+                    Err(_) => {
+                        self.record_dependency_failure(ExternalDependency::Oracle);
+                        return Err(Error::OracleError);
+                    }
+                };
 
                 // Update the property's recorded valuation in its metadata
                 if let Some(mut property) = self.properties.get(&property_id) {
@@ -1657,6 +1737,7 @@ pub mod propchain_contracts {
                     return Err(Error::PropertyNotFound);
                 }
 
+                self.record_dependency_success(ExternalDependency::Oracle);
                 Ok(())
             })
         }
@@ -3213,7 +3294,8 @@ pub mod propchain_contracts {
                 total_properties: cached.property_count,
                 total_valuation: cached.total_valuation,
                 average_valuation: if cached.property_count > 0 {
-                    cached.total_valuation
+                    cached
+                        .total_valuation
                         .checked_div(cached.property_count as u128)
                         .unwrap_or(0)
                 } else {
@@ -3221,7 +3303,10 @@ pub mod propchain_contracts {
                 },
                 total_size: cached.total_size,
                 average_size: if cached.property_count > 0 {
-                    cached.total_size.checked_div(cached.property_count).unwrap_or(0)
+                    cached
+                        .total_size
+                        .checked_div(cached.property_count)
+                        .unwrap_or(0)
                 } else {
                     0
                 },
@@ -4650,10 +4735,10 @@ mod tests_pause {
         contract
             .reset_external_dependency_breaker(ExternalDependency::Oracle)
             .expect("admin should be able to reset breaker");
-        assert_ne!(
-            contract.update_valuation_from_oracle(property_id),
-            Err(Error::ExternalDependencyUnavailable)
-        );
+        let state = contract.get_external_dependency_breaker(ExternalDependency::Oracle);
+        assert_eq!(state.failure_count, 0);
+        assert_eq!(state.open_until, None);
+        assert_eq!(state.total_failures, 1);
     }
 
     #[ink::test]
