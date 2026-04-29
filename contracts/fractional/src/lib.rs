@@ -46,6 +46,22 @@ mod fractional {
         ink::storage::traits::StorageLayout,
     )]
     #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct FractionalDashboard {
+        pub owner: AccountId,
+        pub total_value: u128,
+        pub positions: Vec<PortfolioItem>,
+    }
+
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
     pub struct TaxReport {
         pub total_dividends: u128,
         pub total_proceeds: u128,
@@ -280,6 +296,45 @@ mod fractional {
         #[ink(message)]
         pub fn balance_of(&self, owner: AccountId, token_id: u64) -> u128 {
             self.balances.get(&(owner, token_id)).unwrap_or(0)
+        }
+
+        /// Read-only dashboard view of an owner's fractional holdings.
+        #[ink(message)]
+        pub fn get_fractional_dashboard(
+            &self,
+            owner: AccountId,
+            token_ids: Vec<u64>,
+        ) -> FractionalDashboard {
+            let mut total_value = 0;
+            let mut positions = Vec::new();
+
+            for token_id in token_ids {
+                let shares = self.balances.get(&(owner, token_id)).unwrap_or(0);
+                if shares == 0 {
+                    continue;
+                }
+
+                let price_per_share = self.last_prices.get(token_id).unwrap_or(0);
+                total_value =
+                    total_value.saturating_add(shares.saturating_mul(price_per_share));
+                positions.push(PortfolioItem {
+                    token_id,
+                    shares,
+                    price_per_share,
+                });
+            }
+
+            FractionalDashboard {
+                owner,
+                total_value,
+                positions,
+            }
+        }
+
+        /// Returns total issued shares for a token.
+        #[ink(message)]
+        pub fn total_shares_of(&self, token_id: u64) -> u128 {
+            self.total_shares.get(token_id).unwrap_or(0)
         }
 
         /// List shares for sale at a given price per share.
