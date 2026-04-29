@@ -9,17 +9,16 @@ This document describes the **enhanced compliance and regulatory framework** for
 
 ## Acceptance Criteria Mapping
 
-| Criterion | Implementation |
-|-----------|-----------------|
-| Multi-jurisdictional compliance rules engine | `Jurisdiction`, `JurisdictionRules`, `get_jurisdiction_rules`, `update_jurisdiction_rules`, `check_transaction_compliance(account, operation)` |
-| KYC/AML integration with external providers | `create_verification_request`, `process_verification_request`, `register_service_provider`, `submit_verification`, `update_aml_status` |
-| KYC conversion and verification rates | `get_kyc_metrics()`, `get_jurisdiction_kyc_metrics(jurisdiction)`, `KycMetrics` |
-| Compliance reporting and audit trails | `get_audit_logs`, `get_compliance_report(account)`, `AuditLog`, `ComplianceReport` |
-| Automated compliance checking for transactions | `check_transaction_compliance(account, operation)`, PropertyRegistry `check_compliance()` (cross-call to registry) |
-| Sanction list screening and monitoring | `update_sanctions_status`, `batch_sanctions_check`, `SanctionsList`, `get_sanctions_screening_summary()` |
-| Compliance workflow management | `create_verification_request`, `process_verification_request`, `get_verification_workflow_status(request_id)`, `WorkflowStatus` |
-| Regulatory reporting automation | `get_regulatory_report(jurisdiction, period_start, period_end)` returning `RegulatoryReport` |
-| Compliance documentation and best practices | This doc, `docs/compliance-integration.md`, `contracts/compliance_registry/README.md` |
+| Criterion                                      | Implementation                                                                                                                                 |
+| ---------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Multi-jurisdictional compliance rules engine   | `Jurisdiction`, `JurisdictionRules`, `get_jurisdiction_rules`, `update_jurisdiction_rules`, `check_transaction_compliance(account, operation)` |
+| KYC/AML integration with external providers    | `create_verification_request`, `process_verification_request`, `register_service_provider`, `submit_verification`, `update_aml_status`         |
+| Compliance reporting and audit trails          | `get_audit_logs`, `get_compliance_report(account)`, `AuditLog`, `ComplianceReport`                                                             |
+| Automated compliance checking for transactions | `check_transaction_compliance(account, operation)`, PropertyRegistry `check_compliance()` (cross-call to registry)                             |
+| Sanction list screening and monitoring         | `update_sanctions_status`, `batch_sanctions_check`, `SanctionsList`, `get_sanctions_screening_summary()`                                       |
+| Compliance workflow management                 | `create_verification_request`, `process_verification_request`, `get_verification_workflow_status(request_id)`, `WorkflowStatus`                |
+| Regulatory reporting automation                | `get_regulatory_report(jurisdiction, period_start, period_end)` returning `RegulatoryReport`                                                   |
+| Compliance documentation and best practices    | This doc, `docs/compliance-integration.md`, `contracts/compliance_registry/README.md`                                                          |
 
 ## Multi-Jurisdictional Rules Engine
 
@@ -75,11 +74,11 @@ This document describes the **enhanced compliance and regulatory framework** for
 
 ## PropertyRegistry Integration
 
-| Message | Description |
-|---------|-------------|
-| `set_compliance_registry(Option<AccountId>)` | Admin sets or clears the ComplianceRegistry address. |
-| `get_compliance_registry()` | Returns the current registry address. |
-| `check_account_compliance(AccountId)` | Returns whether the account is compliant (or true if no registry is set). |
+| Message                                      | Description                                                               |
+| -------------------------------------------- | ------------------------------------------------------------------------- |
+| `set_compliance_registry(Option<AccountId>)` | Admin sets or clears the ComplianceRegistry address.                      |
+| `get_compliance_registry()`                  | Returns the current registry address.                                     |
+| `check_account_compliance(AccountId)`        | Returns whether the account is compliant (or true if no registry is set). |
 
 Internal: `check_compliance(account)` is used in `register_property` and `transfer_property`; it performs a cross-call to the registry’s `is_compliant(account)` when the registry is set.
 
@@ -92,9 +91,27 @@ Internal: `check_compliance(account)` is used in `register_property` and `transf
 5. **Audit**: Use `get_audit_logs(account, limit)` and `get_compliance_report(account)` for audits and reporting.
 6. **Jurisdiction rules**: Use `get_jurisdiction_rules(jurisdiction)` and `update_jurisdiction_rules` (admin) to align with local regulations.
 
+## Tax Deadline Notifications (New Feature)
+
+**TaxComplianceModule** (`contracts/tax-compliance/`) now emits events for upcoming tax deadlines:
+
+- **Events**:
+  - `TaxDeadlineApproaching { property_id, jurisdiction_code, reporting_period, due_at, days_remaining, alert_level }` — Emitted <=30 days before due (Urgent <=7 days).
+  - `TaxDeadlineNotification { property_id, jurisdiction_code, reporting_period, due_at, days_remaining }` — Standard notification event.
+
+**Emit Triggers**:
+
+- `calculate_tax()` — On new/updated tax record calculation.
+- `check_compliance()` — During compliance checks.
+
+**Off-chain Usage**: Indexers listen to these events to send push notifications, emails, or in-app alerts to property owners.
+
+**Helper**: `tax_engine::days_until_due(now, due_at) -> Option<u16>` for custom logic.
+
 ## Files
 
 - **Contract**: `contracts/compliance_registry/lib.rs` — ComplianceRegistry logic, traits impl, tests.
+- **Tax Compliance**: `contracts/tax-compliance/src/lib.rs` — Tax deadline events and emits.
 - **Traits**: `contracts/traits/src/lib.rs` — `ComplianceChecker`, `ComplianceOperation`.
 - **Registry integration**: `contracts/lib/src/lib.rs` — `check_compliance`, `check_account_compliance`, `set_compliance_registry`.
 - **Docs**: `docs/compliance-integration.md`, `docs/compliance-regulatory-framework.md`, `docs/compliance-completion-checklist.md`.

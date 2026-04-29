@@ -7,6 +7,19 @@
 // Compliance Types
 // =========================================================================
 
+/// Jurisdiction identifier for regulatory rules
+#[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(
+    feature = "std",
+    derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
+)]
+pub struct Jurisdiction {
+    pub code: u32,
+    pub country_code: [u8; 2],
+    pub region_code: u16,
+    pub locality_code: u16,
+}
+
 /// Transaction type for compliance rules engine
 #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
 #[cfg_attr(
@@ -30,6 +43,20 @@ pub trait ComplianceChecker {
     /// Returns true if the account meets current compliance requirements
     #[ink(message)]
     fn is_compliant(&self, account: ink::primitives::AccountId) -> bool;
+}
+
+/// Trait for automated tax withholding in property transactions
+#[ink::trait_definition]
+pub trait TaxWithholder {
+    /// Calculate and withhold tax for a property transaction.
+    /// Returns the (withheld_amount, tax_collector).
+    #[ink(message)]
+    fn withhold_tax(
+        &mut self,
+        property_id: u64,
+        jurisdiction: Jurisdiction,
+        transaction_amount: u128,
+    ) -> (u128, ink::primitives::AccountId);
 }
 
 // =========================================================================

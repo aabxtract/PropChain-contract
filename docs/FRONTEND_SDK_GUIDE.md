@@ -232,7 +232,8 @@ ERC-721/1155 compatible token operations plus fractional ownership, governance, 
 | `issueShares(signer, tokenId, to, amount)` | `Promise<TxResult>` | Issue shares |
 | `redeemShares(signer, tokenId, amount)` | `Promise<TxResult>` | Redeem shares |
 | `getShareBalance(tokenId, account)` | `Promise<bigint>` | Share balance |
-| `depositDividends(signer, tokenId, amount)` | `Promise<TxResult>` | Deposit dividends |
+| `depositDividends(signer, tokenId, amount)` | `Promise<TxResult>` | Deposit rent or dividend income |
+| `distributeRentalIncome(signer, tokenId, amount)` | `Promise<TxResult>` | Distribute rental income through management agent |
 | `withdrawDividends(signer, tokenId)` | `Promise<TxResult>` | Withdraw dividends |
 
 #### Governance
@@ -250,7 +251,7 @@ ERC-721/1155 compatible token operations plus fractional ownership, governance, 
 |--------|---------|-------------|
 | `placeAsk(signer, tokenId, price, amount)` | `Promise<TxResult>` | Place sell order |
 | `cancelAsk(signer, tokenId)` | `Promise<TxResult>` | Cancel ask |
-| `buyShares(signer, tokenId, seller, amount)` | `Promise<TxResult>` | Buy shares |
+| `buyShares(signer, tokenId, seller, shares, payment)` | `Promise<TxResult>` | Buy shares with attached payment |
 | `getLastTradePrice(tokenId)` | `Promise<bigint>` | Last trade price |
 
 #### Cross-Chain Bridge

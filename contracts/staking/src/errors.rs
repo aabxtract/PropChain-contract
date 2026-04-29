@@ -14,6 +14,14 @@ pub enum Error {
     InvalidDelegate,
     ZeroAmount,
     ReentrantCall,
+    NoVotingPower,
+    ProposalNotFound,
+    ProposalClosed,
+    AlreadyVoted,
+    VotingActive,
+    VotingEnded,
+    QuorumNotReached,
+    TooManyProposals,
 }
 
 impl core::fmt::Display for Error {
@@ -30,6 +38,14 @@ impl core::fmt::Display for Error {
             Error::InvalidDelegate => write!(f, "Invalid delegation target"),
             Error::ZeroAmount => write!(f, "Amount must be greater than zero"),
             Error::ReentrantCall => write!(f, "Reentrant call detected"),
+            Error::NoVotingPower => write!(f, "Caller has no voting power"),
+            Error::ProposalNotFound => write!(f, "Proposal not found"),
+            Error::ProposalClosed => write!(f, "Proposal is no longer active"),
+            Error::AlreadyVoted => write!(f, "Caller already voted on this proposal"),
+            Error::VotingActive => write!(f, "Voting period is still active"),
+            Error::VotingEnded => write!(f, "Voting period has ended"),
+            Error::QuorumNotReached => write!(f, "Quorum not reached"),
+            Error::TooManyProposals => write!(f, "Too many active proposals"),
         }
     }
 }
@@ -48,6 +64,14 @@ impl ContractError for Error {
             Error::InvalidDelegate => staking_codes::STAKING_INVALID_DELEGATE,
             Error::ZeroAmount => staking_codes::STAKING_ZERO_AMOUNT,
             Error::ReentrantCall => 9999,
+            Error::NoVotingPower => staking_codes::STAKING_NO_VOTING_POWER,
+            Error::ProposalNotFound => staking_codes::STAKING_PROPOSAL_NOT_FOUND,
+            Error::ProposalClosed => staking_codes::STAKING_PROPOSAL_CLOSED,
+            Error::AlreadyVoted => staking_codes::STAKING_ALREADY_VOTED,
+            Error::VotingActive => staking_codes::STAKING_VOTING_ACTIVE,
+            Error::VotingEnded => staking_codes::STAKING_VOTING_ENDED,
+            Error::QuorumNotReached => staking_codes::STAKING_QUORUM_NOT_REACHED,
+            Error::TooManyProposals => staking_codes::STAKING_TOO_MANY_PROPOSALS,
         }
     }
 
@@ -64,6 +88,14 @@ impl ContractError for Error {
             Error::InvalidDelegate => "Cannot delegate governance to this address",
             Error::ZeroAmount => "The amount must be greater than zero",
             Error::ReentrantCall => "Reentrant call detected",
+            Error::NoVotingPower => "Caller has zero governance power and cannot vote or propose",
+            Error::ProposalNotFound => "No parameter proposal exists with this id",
+            Error::ProposalClosed => "The proposal has already been finalised",
+            Error::AlreadyVoted => "This account already voted on the proposal",
+            Error::VotingActive => "Cannot execute while the voting window is still open",
+            Error::VotingEnded => "Cannot vote after the voting window has closed",
+            Error::QuorumNotReached => "Total turnout did not meet the quorum threshold",
+            Error::TooManyProposals => "Active proposal limit reached",
         }
     }
 

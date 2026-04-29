@@ -6,6 +6,7 @@
 use ink::prelude::string::String;
 use ink::prelude::vec::Vec;
 use ink::primitives::AccountId;
+use crate::compliance::Jurisdiction;
 
 // =========================================================================
 // Data Types
@@ -132,6 +133,7 @@ pub trait AdvancedEscrow {
         participants: Vec<AccountId>,
         required_signatures: u8,
         release_time_lock: Option<u64>,
+        jurisdiction: Jurisdiction,
     ) -> Result<u64, Self::Error>;
 
     /// Deposit funds to escrow

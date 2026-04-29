@@ -77,6 +77,8 @@ pub enum Error {
     SenderRiskLevelTooHigh,
     /// Recipient risk level too high
     RecipientRiskLevelTooHigh,
+    /// Account is flagged as high risk
+    HighRiskAccount,
 
     /// Token IDs and amounts vectors have different lengths
     LengthMismatch,
@@ -91,8 +93,6 @@ pub enum Error {
     InsufficientRewardPool,
     /// An active stake already exists for this account and token
     AlreadyStaked,
-    /// Token IDs and amounts vectors have different lengths
-    LengthMismatch,
     /// Reentrancy guard detected a reentrant call
     ReentrantCall,
 }
@@ -137,15 +137,14 @@ impl core::fmt::Display for Error {
             Error::HoldPeriodNotMet => write!(f, "Transfer hold period has not been met"),
             Error::SenderRiskLevelTooHigh => write!(f, "Sender risk level is too high"),
             Error::RecipientRiskLevelTooHigh => write!(f, "Recipient risk level is too high"),
+            Error::HighRiskAccount => write!(f, "Account is flagged as high risk"),
 
             Error::LengthMismatch => write!(f, "Token IDs and amounts length mismatch"),
-
             Error::StakeNotFound => write!(f, "Stake not found"),
             Error::LockActive => write!(f, "Stake lock period is still active"),
             Error::NoRewards => write!(f, "No staking rewards available"),
             Error::InsufficientRewardPool => write!(f, "Insufficient reward pool balance"),
             Error::AlreadyStaked => write!(f, "An active stake already exists for this token"),
-            Error::LengthMismatch => write!(f, "Token IDs and amounts length mismatch"),
             Error::ReentrantCall => write!(f, "Reentrant call"),
         }
     }
@@ -189,15 +188,14 @@ impl ContractError for Error {
             Error::HoldPeriodNotMet => property_token_codes::HOLD_PERIOD_NOT_MET,
             Error::SenderRiskLevelTooHigh => property_token_codes::SENDER_RISK_LEVEL_TOO_HIGH,
             Error::RecipientRiskLevelTooHigh => property_token_codes::RECIPIENT_RISK_LEVEL_TOO_HIGH,
+            Error::HighRiskAccount => property_token_codes::HIGH_RISK_ACCOUNT,
 
             Error::LengthMismatch => property_token_codes::BATCH_SIZE_EXCEEDED,
-
             Error::StakeNotFound => property_token_codes::STAKE_NOT_FOUND,
             Error::LockActive => property_token_codes::LOCK_ACTIVE,
             Error::NoRewards => property_token_codes::NO_REWARDS,
             Error::InsufficientRewardPool => property_token_codes::INSUFFICIENT_REWARD_POOL,
             Error::AlreadyStaked => property_token_codes::ALREADY_STAKED,
-            Error::LengthMismatch => property_token_codes::BATCH_SIZE_EXCEEDED,
             Error::ReentrantCall => property_token_codes::REENTRANT_CALL,
         }
     }
@@ -247,6 +245,7 @@ impl ContractError for Error {
             Error::HoldPeriodNotMet => "The minimum hold period for this token has not been met",
             Error::SenderRiskLevelTooHigh => "Sender's risk level is too high for this transfer",
             Error::RecipientRiskLevelTooHigh => "Recipient's risk level is too high for this transfer",
+            Error::HighRiskAccount => "The account is flagged as high risk and cannot complete this transfer",
             Error::StakeNotFound => "No active stake found for this account and token",
             Error::LockActive => {
                 "The stake lock period has not yet expired; unstaking is not permitted"

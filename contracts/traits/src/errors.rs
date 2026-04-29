@@ -278,6 +278,7 @@ pub mod property_token_codes {
     pub const HOLD_PERIOD_NOT_MET: u32 = 1032;
     pub const SENDER_RISK_LEVEL_TOO_HIGH: u32 = 1033;
     pub const RECIPIENT_RISK_LEVEL_TOO_HIGH: u32 = 1034;
+    pub const HIGH_RISK_ACCOUNT: u32 = 1035;
     pub const STAKE_NOT_FOUND: u32 = 1026;
     pub const LOCK_ACTIVE: u32 = 1027;
     pub const NO_REWARDS: u32 = 1028;
@@ -429,6 +430,14 @@ pub mod staking_codes {
     pub const STAKING_INVALID_DELEGATE: u32 = 9009;
     pub const STAKING_ZERO_AMOUNT: u32 = 9010;
     pub const REENTRANT_CALL: u32 = 9011;
+    pub const STAKING_NO_VOTING_POWER: u32 = 9012;
+    pub const STAKING_PROPOSAL_NOT_FOUND: u32 = 9013;
+    pub const STAKING_PROPOSAL_CLOSED: u32 = 9014;
+    pub const STAKING_ALREADY_VOTED: u32 = 9015;
+    pub const STAKING_VOTING_ACTIVE: u32 = 9016;
+    pub const STAKING_VOTING_ENDED: u32 = 9017;
+    pub const STAKING_QUORUM_NOT_REACHED: u32 = 9018;
+    pub const STAKING_TOO_MANY_PROPOSALS: u32 = 9019;
 }
 
 /// Monitoring error codes (10000-10999)

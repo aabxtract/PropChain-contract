@@ -786,7 +786,7 @@ fn test_port_identity_success() {
         Ok(())
     );
 
-    let new_account = AccountId::from([2u8; 32]);
+    let new_account = AccountId::from([99u8; 32]);
 
     // Port identity from bob to new_account
     assert_eq!(identity_registry.port_identity(new_account), Ok(()));

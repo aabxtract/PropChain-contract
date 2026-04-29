@@ -301,7 +301,28 @@ export class PropertyTokenClient {
     amount: bigint,
     onProgress?: TxProgressCallback,
   ): Promise<TxResult> {
-    return this.submitTx(signer, 'deposit_dividends', [tokenId, amount.toString()], onProgress);
+    return this.submitTx(
+      signer,
+      'deposit_dividends',
+      [tokenId],
+      onProgress,
+      { value: amount },
+    );
+  }
+
+  async distributeRentalIncome(
+    signer: Signer,
+    tokenId: number,
+    amount: bigint,
+    onProgress?: TxProgressCallback,
+  ): Promise<TxResult> {
+    return this.submitTx(
+      signer,
+      'distribute_rental_income',
+      [tokenId],
+      onProgress,
+      { value: amount },
+    );
   }
 
   /**
@@ -421,10 +442,17 @@ export class PropertyTokenClient {
     signer: Signer,
     tokenId: number,
     seller: string,
-    amount: bigint,
+    shares: bigint,
+    payment: bigint,
     onProgress?: TxProgressCallback,
   ): Promise<TxResult> {
-    return this.submitTx(signer, 'buy_shares', [tokenId, seller, amount.toString()], onProgress);
+    return this.submitTx(
+      signer,
+      'buy_shares',
+      [tokenId, seller, shares.toString()],
+      onProgress,
+      { value: payment },
+    );
   }
 
   /**
@@ -634,8 +662,10 @@ export class PropertyTokenClient {
     method: string,
     args: unknown[],
     onProgress?: TxProgressCallback,
+    options?: { value?: bigint },
   ): Promise<TxResult> {
     const signerAddress = typeof signer === 'string' ? signer : signer.address;
+    const value = options?.value ?? 0n;
 
     const queryFn = this.contract.query[method];
     if (!queryFn) {
@@ -644,7 +674,7 @@ export class PropertyTokenClient {
 
     const { gasRequired, result: dryRunResult } = await queryFn(
       signerAddress,
-      { gasLimit: -1 },
+      { gasLimit: -1, value },
       ...args,
     );
 
@@ -663,7 +693,7 @@ export class PropertyTokenClient {
     const gasLimit = await this.applyGasBuffer(BigInt(gasRequired?.toString() ?? '0'));
 
     return new Promise<TxResult>((resolve, reject) => {
-      const tx = txFn({ gasLimit }, ...args);
+      const tx = txFn({ gasLimit, value }, ...args);
 
       tx.signAndSend(
         signer as KeyringPair,

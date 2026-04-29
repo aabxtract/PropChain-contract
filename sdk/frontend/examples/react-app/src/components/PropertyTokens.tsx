@@ -158,6 +158,11 @@ await client.propertyToken
   .depositDividends(signer, tokenId,
     BigInt(10000));
 
+// Distribute recurring rental income
+await client.propertyToken
+  .distributeRentalIncome(signer, tokenId,
+    BigInt(5000));
+
 // Check share balance
 const balance = await client
   .propertyToken
@@ -272,7 +277,8 @@ await client.propertyToken.placeAsk(
 await client.propertyToken.buyShares(
   signer, tokenId,
   sellerAddress,
-  BigInt(25) // amount
+  BigInt(25), // number of shares
+  BigInt(2500), // payment attached
 );
 
 // Check last trade price

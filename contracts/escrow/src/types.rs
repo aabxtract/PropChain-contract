@@ -1,4 +1,5 @@
 // Data types for the escrow contract (Issue #101 - extracted from lib.rs)
+use propchain_traits::Jurisdiction;
 
 #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
@@ -36,6 +37,7 @@ pub struct EscrowData {
     pub created_at: u64,
     pub release_time_lock: Option<u64>,
     pub participants: Vec<AccountId>,
+    pub jurisdiction: Jurisdiction,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
