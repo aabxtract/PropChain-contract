@@ -1,4 +1,63 @@
 // Data types for the insurance contract (Issue #101 - extracted from lib.rs)
+// External insurance provider types added for Issue #250
+
+/// Status of a hybrid coverage request sent to an external provider.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum CoverageRequestStatus {
+    /// Submitted on-chain; awaiting off-chain provider response.
+    Pending,
+    /// Provider confirmed coverage; hybrid policy is active.
+    Confirmed,
+    /// Provider declined the request.
+    Declined,
+    /// Request cancelled by the policyholder or admin.
+    Cancelled,
+}
+
+/// A registered external (traditional) insurance provider.
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ExternalProvider {
+    pub provider_id: u64,
+    pub name: String,
+    /// Off-chain API endpoint URL stored on-chain for reference / indexers.
+    pub api_endpoint: String,
+    pub supported_coverage_types: Vec<CoverageType>,
+    pub is_active: bool,
+    pub registered_at: u64,
+}
+
+/// A request for hybrid coverage sent to an external provider.
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ExternalCoverageRequest {
+    pub request_id: u64,
+    pub provider_id: u64,
+    pub policy_id: u64,
+    pub requester: AccountId,
+    pub coverage_type: CoverageType,
+    pub coverage_amount: u128,
+    pub status: CoverageRequestStatus,
+    pub requested_at: u64,
+    /// Quote returned by the provider (set when Confirmed).
+    pub provider_quote: u128,
+    /// Free-form reference string from the provider (e.g. policy number).
+    pub provider_reference: String,
+    pub responded_at: Option<u64>,
+}
 
 #[derive(
     Debug,

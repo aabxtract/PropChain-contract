@@ -86,6 +86,14 @@ mod propchain_insurance {
 
         // Reentrancy protection
         reentrancy_guard: ReentrancyGuard,
+
+        // ── External insurance providers (Issue #250) ─────────────────────────
+        external_providers: Mapping<u64, ExternalProvider>,
+        provider_count: u64,
+        coverage_requests: Mapping<u64, ExternalCoverageRequest>,
+        coverage_request_count: u64,
+        /// policy_id → list of coverage request IDs
+        policy_coverage_requests: Mapping<u64, Vec<u64>>,
     }
 
     // =========================================================================
@@ -210,6 +218,37 @@ mod propchain_insurance {
         timestamp: u64,
     }
 
+    // ── External provider events (Issue #250) ─────────────────────────────────
+
+    #[ink(event)]
+    pub struct ProviderRegistered {
+        #[ink(topic)]
+        provider_id: u64,
+        name: String,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct CoverageRequested {
+        #[ink(topic)]
+        request_id: u64,
+        #[ink(topic)]
+        provider_id: u64,
+        #[ink(topic)]
+        policy_id: u64,
+        coverage_amount: u128,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct CoverageResponseRecorded {
+        #[ink(topic)]
+        request_id: u64,
+        status: CoverageRequestStatus,
+        provider_quote: u128,
+        timestamp: u64,
+    }
+
     // =========================================================================
     // IMPLEMENTATION
     // =========================================================================
@@ -246,6 +285,12 @@ mod propchain_insurance {
                 claim_cooldown_period: 2_592_000,  // 30 days in seconds
                 min_pool_capital: 100_000_000_000, // Minimum pool capital
                 reentrancy_guard: ReentrancyGuard::new(),
+                // External providers (Issue #250)
+                external_providers: Mapping::default(),
+                provider_count: 0,
+                coverage_requests: Mapping::default(),
+                coverage_request_count: 0,
+                policy_coverage_requests: Mapping::default(),
             }
         }
 
@@ -957,6 +1002,230 @@ mod propchain_insurance {
         }
 
         // =====================================================================
+        // EXTERNAL INSURANCE PROVIDERS (Issue #250)
+        // =====================================================================
+
+        /// Register an external insurance provider (admin only).
+        ///
+        /// Stores the provider's name, API endpoint, and supported coverage
+        /// types on-chain so indexers and front-ends can discover them.
+        #[ink(message)]
+        pub fn register_external_provider(
+            &mut self,
+            name: String,
+            api_endpoint: String,
+            supported_coverage_types: Vec<CoverageType>,
+        ) -> Result<u64, InsuranceError> {
+            self.ensure_admin()?;
+
+            let provider_id = self.provider_count + 1;
+            self.provider_count = provider_id;
+
+            let provider = ExternalProvider {
+                provider_id,
+                name: name.clone(),
+                api_endpoint,
+                supported_coverage_types,
+                is_active: true,
+                registered_at: self.env().block_timestamp(),
+            };
+            self.external_providers.insert(&provider_id, &provider);
+
+            self.env().emit_event(ProviderRegistered {
+                provider_id,
+                name,
+                timestamp: self.env().block_timestamp(),
+            });
+
+            Ok(provider_id)
+        }
+
+        /// Deactivate an external provider (admin only).
+        #[ink(message)]
+        pub fn deactivate_external_provider(
+            &mut self,
+            provider_id: u64,
+        ) -> Result<(), InsuranceError> {
+            self.ensure_admin()?;
+            let mut provider = self
+                .external_providers
+                .get(&provider_id)
+                .ok_or(InsuranceError::ProviderNotFound)?;
+            provider.is_active = false;
+            self.external_providers.insert(&provider_id, &provider);
+            Ok(())
+        }
+
+        /// Request hybrid coverage from an external provider for an existing policy.
+        ///
+        /// Records the request on-chain. The actual API call happens off-chain
+        /// (by an indexer or relayer); the provider's response is then submitted
+        /// back via `record_coverage_response`.
+        #[ink(message)]
+        pub fn request_external_coverage(
+            &mut self,
+            policy_id: u64,
+            provider_id: u64,
+            coverage_amount: u128,
+        ) -> Result<u64, InsuranceError> {
+            let caller = self.env().caller();
+
+            let policy = self
+                .policies
+                .get(&policy_id)
+                .ok_or(InsuranceError::PolicyNotFound)?;
+            if policy.policyholder != caller {
+                return Err(InsuranceError::Unauthorized);
+            }
+            if policy.status != PolicyStatus::Active {
+                return Err(InsuranceError::PolicyInactive);
+            }
+
+            let provider = self
+                .external_providers
+                .get(&provider_id)
+                .ok_or(InsuranceError::ProviderNotFound)?;
+            if !provider.is_active {
+                return Err(InsuranceError::ProviderInactive);
+            }
+            if !provider.supported_coverage_types.contains(&policy.coverage_type) {
+                return Err(InsuranceError::UnsupportedCoverageType);
+            }
+
+            let request_id = self.coverage_request_count + 1;
+            self.coverage_request_count = request_id;
+
+            let now = self.env().block_timestamp();
+            let request = ExternalCoverageRequest {
+                request_id,
+                provider_id,
+                policy_id,
+                requester: caller,
+                coverage_type: policy.coverage_type,
+                coverage_amount,
+                status: CoverageRequestStatus::Pending,
+                requested_at: now,
+                provider_quote: 0,
+                provider_reference: String::new(),
+                responded_at: None,
+            };
+            self.coverage_requests.insert(&request_id, &request);
+
+            let mut req_list = self
+                .policy_coverage_requests
+                .get(&policy_id)
+                .unwrap_or_default();
+            req_list.push(request_id);
+            self.policy_coverage_requests.insert(&policy_id, &req_list);
+
+            self.env().emit_event(CoverageRequested {
+                request_id,
+                provider_id,
+                policy_id,
+                coverage_amount,
+                timestamp: now,
+            });
+
+            Ok(request_id)
+        }
+
+        /// Record the external provider's response to a coverage request.
+        ///
+        /// Only authorized oracles or the admin may call this (acting as the
+        /// trusted relayer that bridges the off-chain API response on-chain).
+        #[ink(message)]
+        pub fn record_coverage_response(
+            &mut self,
+            request_id: u64,
+            confirmed: bool,
+            provider_quote: u128,
+            provider_reference: String,
+        ) -> Result<(), InsuranceError> {
+            let caller = self.env().caller();
+            if caller != self.admin && !self.authorized_oracles.get(&caller).unwrap_or(false) {
+                return Err(InsuranceError::Unauthorized);
+            }
+
+            let mut request = self
+                .coverage_requests
+                .get(&request_id)
+                .ok_or(InsuranceError::CoverageRequestNotFound)?;
+
+            if request.status != CoverageRequestStatus::Pending {
+                return Err(InsuranceError::CoverageRequestNotPending);
+            }
+
+            let now = self.env().block_timestamp();
+            request.status = if confirmed {
+                CoverageRequestStatus::Confirmed
+            } else {
+                CoverageRequestStatus::Declined
+            };
+            request.provider_quote = provider_quote;
+            request.provider_reference = provider_reference;
+            request.responded_at = Some(now);
+            self.coverage_requests.insert(&request_id, &request);
+
+            self.env().emit_event(CoverageResponseRecorded {
+                request_id,
+                status: request.status,
+                provider_quote,
+                timestamp: now,
+            });
+
+            Ok(())
+        }
+
+        /// Cancel a pending coverage request (requester or admin).
+        #[ink(message)]
+        pub fn cancel_coverage_request(&mut self, request_id: u64) -> Result<(), InsuranceError> {
+            let caller = self.env().caller();
+            let mut request = self
+                .coverage_requests
+                .get(&request_id)
+                .ok_or(InsuranceError::CoverageRequestNotFound)?;
+
+            if caller != request.requester && caller != self.admin {
+                return Err(InsuranceError::Unauthorized);
+            }
+            if request.status != CoverageRequestStatus::Pending {
+                return Err(InsuranceError::CoverageRequestNotPending);
+            }
+
+            request.status = CoverageRequestStatus::Cancelled;
+            self.coverage_requests.insert(&request_id, &request);
+            Ok(())
+        }
+
+        // ── External provider queries ─────────────────────────────────────────
+
+        /// Get an external provider by ID.
+        #[ink(message)]
+        pub fn get_external_provider(&self, provider_id: u64) -> Option<ExternalProvider> {
+            self.external_providers.get(&provider_id)
+        }
+
+        /// Get a coverage request by ID.
+        #[ink(message)]
+        pub fn get_coverage_request(&self, request_id: u64) -> Option<ExternalCoverageRequest> {
+            self.coverage_requests.get(&request_id)
+        }
+
+        /// Get all coverage request IDs for a policy.
+        #[ink(message)]
+        pub fn get_policy_coverage_requests(&self, policy_id: u64) -> Vec<u64> {
+            self.policy_coverage_requests
+                .get(&policy_id)
+                .unwrap_or_default()
+        }
+
+        /// Get total provider count.
+        #[ink(message)]
+        pub fn get_provider_count(&self) -> u64 {
+            self.provider_count
+        }
+
+        // =====================================================================
         // ADMIN / AUTHORITY MANAGEMENT
         // =====================================================================
 
@@ -1287,3 +1556,5 @@ mod propchain_insurance {
 pub use crate::propchain_insurance::{InsuranceError, PropertyInsurance};
 
 // Unit tests extracted to tests.rs (Issue #101)
+#[path = "tests.rs"]
+mod insurance_tests_module;

@@ -853,4 +853,295 @@ mod insurance_tests {
         let holder_policies = contract.get_policyholder_policies(accounts.bob);
         assert_eq!(holder_policies.len(), 2);
     }
+
+    // =========================================================================
+    // EXTERNAL INSURANCE PROVIDER TESTS (Issue #250)
+    // =========================================================================
+
+    use crate::propchain_insurance::CoverageRequestStatus;
+
+    fn register_provider(contract: &mut PropertyInsurance) -> u64 {
+        contract
+            .register_external_provider(
+                "Acme Insurance".into(),
+                "https://api.acme-insurance.com/v1".into(),
+                vec![CoverageType::Fire, CoverageType::Flood],
+            )
+            .expect("register provider failed")
+    }
+
+    fn setup_active_policy(contract: &mut PropertyInsurance) -> u64 {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = create_pool(contract);
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.provide_pool_liquidity(pool_id).unwrap();
+        add_risk_assessment(contract, 1);
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        let policy_id = contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://test".into(),
+            )
+            .unwrap();
+        test::set_value_transferred::<DefaultEnvironment>(0);
+        policy_id
+    }
+
+    #[ink::test]
+    fn test_register_provider_works() {
+        let mut contract = setup();
+        let provider_id = register_provider(&mut contract);
+        assert_eq!(provider_id, 1);
+        assert_eq!(contract.get_provider_count(), 1);
+
+        let provider = contract.get_external_provider(provider_id).unwrap();
+        assert_eq!(provider.name, "Acme Insurance");
+        assert_eq!(provider.api_endpoint, "https://api.acme-insurance.com/v1");
+        assert!(provider.is_active);
+        assert!(provider.supported_coverage_types.contains(&CoverageType::Fire));
+    }
+
+    #[ink::test]
+    fn test_register_provider_unauthorized_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let result = contract.register_external_provider(
+            "Rogue".into(),
+            "https://rogue.io".into(),
+            vec![CoverageType::Fire],
+        );
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
+    }
+
+    #[ink::test]
+    fn test_deactivate_provider_works() {
+        let mut contract = setup();
+        let provider_id = register_provider(&mut contract);
+        assert!(contract.deactivate_external_provider(provider_id).is_ok());
+        let provider = contract.get_external_provider(provider_id).unwrap();
+        assert!(!provider.is_active);
+    }
+
+    #[ink::test]
+    fn test_deactivate_nonexistent_provider_fails() {
+        let mut contract = setup();
+        let result = contract.deactivate_external_provider(999);
+        assert_eq!(result, Err(InsuranceError::ProviderNotFound));
+    }
+
+    #[ink::test]
+    fn test_request_external_coverage_works() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let provider_id = register_provider(&mut contract);
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let result = contract.request_external_coverage(policy_id, provider_id, 200_000_000_000u128);
+        assert!(result.is_ok());
+        let request_id = result.unwrap();
+        assert_eq!(request_id, 1);
+
+        let request = contract.get_coverage_request(request_id).unwrap();
+        assert_eq!(request.policy_id, policy_id);
+        assert_eq!(request.provider_id, provider_id);
+        assert_eq!(request.coverage_amount, 200_000_000_000u128);
+        assert_eq!(request.status, CoverageRequestStatus::Pending);
+
+        let ids = contract.get_policy_coverage_requests(policy_id);
+        assert_eq!(ids, vec![request_id]);
+    }
+
+    #[ink::test]
+    fn test_request_coverage_non_policyholder_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let provider_id = register_provider(&mut contract);
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        let result = contract.request_external_coverage(policy_id, provider_id, 100_000u128);
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
+    }
+
+    #[ink::test]
+    fn test_request_coverage_inactive_provider_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let provider_id = register_provider(&mut contract);
+        contract.deactivate_external_provider(provider_id).unwrap();
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let result = contract.request_external_coverage(policy_id, provider_id, 100_000u128);
+        assert_eq!(result, Err(InsuranceError::ProviderInactive));
+    }
+
+    #[ink::test]
+    fn test_request_coverage_unsupported_type_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        // Provider only supports Fire and Flood; policy is Fire — create an Earthquake policy
+        let provider_id = contract
+            .register_external_provider(
+                "Limited Co".into(),
+                "https://limited.io".into(),
+                vec![CoverageType::Theft], // does NOT include Fire
+            )
+            .unwrap();
+        let policy_id = setup_active_policy(&mut contract); // Fire policy
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let result = contract.request_external_coverage(policy_id, provider_id, 100_000u128);
+        assert_eq!(result, Err(InsuranceError::UnsupportedCoverageType));
+    }
+
+    #[ink::test]
+    fn test_record_coverage_response_confirmed() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let provider_id = register_provider(&mut contract);
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let request_id = contract
+            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
+            .unwrap();
+
+        // Admin records the provider's confirmation
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let result = contract.record_coverage_response(
+            request_id,
+            true,
+            5_000_000_000u128,
+            "ACME-POL-12345".into(),
+        );
+        assert!(result.is_ok());
+
+        let request = contract.get_coverage_request(request_id).unwrap();
+        assert_eq!(request.status, CoverageRequestStatus::Confirmed);
+        assert_eq!(request.provider_quote, 5_000_000_000u128);
+        assert_eq!(request.provider_reference, "ACME-POL-12345");
+        assert!(request.responded_at.is_some());
+    }
+
+    #[ink::test]
+    fn test_record_coverage_response_declined() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let provider_id = register_provider(&mut contract);
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let request_id = contract
+            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract
+            .record_coverage_response(request_id, false, 0, "Declined: high risk".into())
+            .unwrap();
+
+        let request = contract.get_coverage_request(request_id).unwrap();
+        assert_eq!(request.status, CoverageRequestStatus::Declined);
+    }
+
+    #[ink::test]
+    fn test_record_response_unauthorized_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let provider_id = register_provider(&mut contract);
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let request_id = contract
+            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
+            .unwrap();
+
+        // Bob is not an oracle
+        let result = contract.record_coverage_response(request_id, true, 0, "".into());
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
+    }
+
+    #[ink::test]
+    fn test_record_response_twice_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let provider_id = register_provider(&mut contract);
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let request_id = contract
+            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract
+            .record_coverage_response(request_id, true, 1_000u128, "REF".into())
+            .unwrap();
+        let result = contract.record_coverage_response(request_id, false, 0, "".into());
+        assert_eq!(result, Err(InsuranceError::CoverageRequestNotPending));
+    }
+
+    #[ink::test]
+    fn test_cancel_coverage_request_works() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let provider_id = register_provider(&mut contract);
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let request_id = contract
+            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
+            .unwrap();
+
+        let result = contract.cancel_coverage_request(request_id);
+        assert!(result.is_ok());
+        let request = contract.get_coverage_request(request_id).unwrap();
+        assert_eq!(request.status, CoverageRequestStatus::Cancelled);
+    }
+
+    #[ink::test]
+    fn test_cancel_request_non_requester_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let provider_id = register_provider(&mut contract);
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let request_id = contract
+            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        let result = contract.cancel_coverage_request(request_id);
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
+    }
+
+    #[ink::test]
+    fn test_authorized_oracle_can_record_response() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        contract.authorize_oracle(accounts.charlie).unwrap();
+        let provider_id = register_provider(&mut contract);
+        let policy_id = setup_active_policy(&mut contract);
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let request_id = contract
+            .request_external_coverage(policy_id, provider_id, 200_000_000_000u128)
+            .unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        let result = contract.record_coverage_response(request_id, true, 1_000u128, "REF".into());
+        assert!(result.is_ok());
+    }
 }

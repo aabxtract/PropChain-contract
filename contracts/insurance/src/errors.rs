@@ -23,4 +23,10 @@ pub enum InsuranceError {
     PropertyNotInsurable,
     DuplicateClaim,
     ReentrantCall,
+    // External provider errors (Issue #250)
+    ProviderNotFound,
+    ProviderInactive,
+    CoverageRequestNotFound,
+    CoverageRequestNotPending,
+    UnsupportedCoverageType,
 }
