@@ -14,7 +14,7 @@ use ink::storage::Mapping;
 mod propchain_insurance {
     use super::*;
     use ink::prelude::{string::String, vec::Vec};
-    use propchain_contracts::{non_reentrant, ReentrancyError, ReentrancyGuard};
+    use propchain_traits::{non_reentrant, ReentrancyError, ReentrancyGuard};
 
     // Error types extracted to errors.rs (Issue #101)
     include!("errors.rs");
@@ -78,6 +78,11 @@ mod propchain_insurance {
 
         // Claim cooldown: property_id -> last_claim_timestamp
         claim_cooldowns: Mapping<u64, u64>,
+
+        // Claim automation: oracle-triggered parametric claims
+        claim_triggers: Mapping<u64, ClaimTrigger>,
+        trigger_count: u64,
+        policy_triggers: Mapping<u64, Vec<u64>>, // policy_id -> trigger_ids
 
         // Platform settings
         platform_fee_rate: u32,     // Basis points (e.g. 200 = 2%)
@@ -210,6 +215,47 @@ mod propchain_insurance {
         timestamp: u64,
     }
 
+    #[ink(event)]
+    pub struct ClaimTriggerRegistered {
+        #[ink(topic)]
+        trigger_id: u64,
+        #[ink(topic)]
+        policy_id: u64,
+        metric: TriggerMetric,
+        threshold: u128,
+    }
+
+    #[ink(event)]
+    pub struct ClaimTriggerDeactivated {
+        #[ink(topic)]
+        trigger_id: u64,
+        #[ink(topic)]
+        policy_id: u64,
+    }
+
+    #[ink(event)]
+    pub struct OracleEventReceived {
+        #[ink(topic)]
+        trigger_id: u64,
+        #[ink(topic)]
+        oracle: AccountId,
+        observed_value: u128,
+        threshold_met: bool,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct ClaimAutoPaid {
+        #[ink(topic)]
+        trigger_id: u64,
+        #[ink(topic)]
+        claim_id: u64,
+        #[ink(topic)]
+        policy_id: u64,
+        payout_amount: u128,
+        timestamp: u64,
+    }
+
     // =========================================================================
     // IMPLEMENTATION
     // =========================================================================
@@ -242,6 +288,9 @@ mod propchain_insurance {
                 authorized_oracles: Mapping::default(),
                 authorized_assessors: Mapping::default(),
                 claim_cooldowns: Mapping::default(),
+                claim_triggers: Mapping::default(),
+                trigger_count: 0,
+                policy_triggers: Mapping::default(),
                 platform_fee_rate: 200,            // 2%
                 claim_cooldown_period: 2_592_000,  // 30 days in seconds
                 min_pool_capital: 100_000_000_000, // Minimum pool capital
@@ -748,6 +797,266 @@ mod propchain_insurance {
         }
 
         // =====================================================================
+        // CLAIM AUTOMATION (oracle-triggered parametric claims)
+        // =====================================================================
+
+        /// Register an oracle-driven claim trigger against a policy. The
+        /// policyholder or admin may register; once an authorized oracle reports
+        /// a value satisfying the comparator/threshold via `report_oracle_event`,
+        /// the contract creates, approves, and pays a claim automatically.
+        #[ink(message)]
+        pub fn register_claim_trigger(
+            &mut self,
+            policy_id: u64,
+            metric: TriggerMetric,
+            comparator: TriggerComparator,
+            threshold: u128,
+            payout_mode: PayoutMode,
+        ) -> Result<u64, InsuranceError> {
+            let caller = self.env().caller();
+
+            let policy = self
+                .policies
+                .get(&policy_id)
+                .ok_or(InsuranceError::PolicyNotFound)?;
+            if caller != policy.policyholder && caller != self.admin {
+                return Err(InsuranceError::Unauthorized);
+            }
+            if policy.status != PolicyStatus::Active {
+                return Err(InsuranceError::PolicyInactive);
+            }
+            Self::ensure_payout_mode_valid(&payout_mode)?;
+
+            let trigger_id = self.trigger_count + 1;
+            self.trigger_count = trigger_id;
+            let now = self.env().block_timestamp();
+
+            let trigger = ClaimTrigger {
+                trigger_id,
+                policy_id,
+                metric,
+                comparator,
+                threshold,
+                payout_mode,
+                is_active: true,
+                triggered: false,
+                last_observed_value: None,
+                last_report_url: String::new(),
+                created_at: now,
+                triggered_at: None,
+                triggering_claim_id: None,
+            };
+            self.claim_triggers.insert(&trigger_id, &trigger);
+
+            let mut list = self.policy_triggers.get(&policy_id).unwrap_or_default();
+            list.push(trigger_id);
+            self.policy_triggers.insert(&policy_id, &list);
+
+            self.env().emit_event(ClaimTriggerRegistered {
+                trigger_id,
+                policy_id,
+                metric,
+                threshold,
+            });
+
+            Ok(trigger_id)
+        }
+
+        /// Deactivate an active trigger. Only the policyholder or admin may
+        /// deactivate. Already-fired triggers cannot be re-deactivated.
+        #[ink(message)]
+        pub fn deactivate_claim_trigger(
+            &mut self,
+            trigger_id: u64,
+        ) -> Result<(), InsuranceError> {
+            let caller = self.env().caller();
+            let mut trigger = self
+                .claim_triggers
+                .get(&trigger_id)
+                .ok_or(InsuranceError::TriggerNotFound)?;
+            if !trigger.is_active {
+                return Err(InsuranceError::TriggerInactive);
+            }
+
+            let policy = self
+                .policies
+                .get(&trigger.policy_id)
+                .ok_or(InsuranceError::PolicyNotFound)?;
+            if caller != policy.policyholder && caller != self.admin {
+                return Err(InsuranceError::Unauthorized);
+            }
+
+            trigger.is_active = false;
+            self.claim_triggers.insert(&trigger_id, &trigger);
+
+            self.env().emit_event(ClaimTriggerDeactivated {
+                trigger_id,
+                policy_id: trigger.policy_id,
+            });
+            Ok(())
+        }
+
+        /// Oracle entry point: report an observed value for a trigger. If the
+        /// value meets the trigger condition and the underlying policy is
+        /// still payable, this auto-creates an approved claim and runs the
+        /// payout in one transaction.
+        ///
+        /// Callers must be admin or an authorized oracle. The trigger fires
+        /// at most once. If the condition is not met, the report is recorded
+        /// but no claim is created.
+        #[ink(message)]
+        pub fn report_oracle_event(
+            &mut self,
+            trigger_id: u64,
+            observed_value: u128,
+            oracle_report_url: String,
+        ) -> Result<Option<u64>, InsuranceError> {
+            non_reentrant!(self, {
+                let caller = self.env().caller();
+                if caller != self.admin && !self.authorized_oracles.get(&caller).unwrap_or(false) {
+                    return Err(InsuranceError::Unauthorized);
+                }
+
+                let mut trigger = self
+                    .claim_triggers
+                    .get(&trigger_id)
+                    .ok_or(InsuranceError::TriggerNotFound)?;
+                if !trigger.is_active {
+                    return Err(InsuranceError::TriggerInactive);
+                }
+                if trigger.triggered {
+                    return Err(InsuranceError::TriggerAlreadyFired);
+                }
+
+                let now = self.env().block_timestamp();
+                let condition_met = Self::evaluate_condition(
+                    &trigger.comparator,
+                    observed_value,
+                    trigger.threshold,
+                );
+
+                trigger.last_observed_value = Some(observed_value);
+                trigger.last_report_url = oracle_report_url.clone();
+
+                self.env().emit_event(OracleEventReceived {
+                    trigger_id,
+                    oracle: caller,
+                    observed_value,
+                    threshold_met: condition_met,
+                    timestamp: now,
+                });
+
+                if !condition_met {
+                    self.claim_triggers.insert(&trigger_id, &trigger);
+                    return Ok(None);
+                }
+
+                let mut policy = self
+                    .policies
+                    .get(&trigger.policy_id)
+                    .ok_or(InsuranceError::PolicyNotFound)?;
+                if policy.status != PolicyStatus::Active {
+                    return Err(InsuranceError::PolicyInactive);
+                }
+                if now > policy.end_time {
+                    return Err(InsuranceError::PolicyExpired);
+                }
+
+                let last_claim = self.claim_cooldowns.get(&policy.property_id).unwrap_or(0);
+                if now.saturating_sub(last_claim) < self.claim_cooldown_period {
+                    return Err(InsuranceError::CooldownPeriodActive);
+                }
+
+                let remaining = policy.coverage_amount.saturating_sub(policy.total_claimed);
+                if remaining == 0 {
+                    return Err(InsuranceError::ClaimExceedsCoverage);
+                }
+                let claim_amount =
+                    Self::compute_claim_amount(&trigger.payout_mode, remaining)?;
+                if claim_amount == 0 {
+                    return Err(InsuranceError::TriggerConditionNotMet);
+                }
+                let payout = claim_amount.saturating_sub(policy.deductible);
+
+                // Create the auto-claim record.
+                let claim_id = self.claim_count + 1;
+                self.claim_count = claim_id;
+
+                let mut claim = InsuranceClaim {
+                    claim_id,
+                    policy_id: trigger.policy_id,
+                    claimant: policy.policyholder,
+                    claim_amount,
+                    description: String::from("Oracle-triggered parametric claim"),
+                    evidence_url: String::new(),
+                    oracle_report_url: oracle_report_url.clone(),
+                    status: ClaimStatus::OracleVerifying,
+                    submitted_at: now,
+                    processed_at: Some(now),
+                    payout_amount: payout,
+                    assessor: Some(caller),
+                    rejection_reason: String::new(),
+                };
+
+                policy.claims_count += 1;
+                self.policies.insert(&trigger.policy_id, &policy);
+
+                let mut policy_claims =
+                    self.policy_claims.get(&trigger.policy_id).unwrap_or_default();
+                policy_claims.push(claim_id);
+                self.policy_claims
+                    .insert(&trigger.policy_id, &policy_claims);
+
+                claim.status = ClaimStatus::Approved;
+                self.claims.insert(&claim_id, &claim);
+
+                self.env().emit_event(ClaimApproved {
+                    claim_id,
+                    policy_id: trigger.policy_id,
+                    payout_amount: payout,
+                    approved_by: caller,
+                    timestamp: now,
+                });
+
+                // Run payout (debits pool, marks claim Paid, updates cooldown).
+                self.execute_payout(claim_id, trigger.policy_id, policy.policyholder, payout)?;
+
+                trigger.triggered = true;
+                trigger.triggered_at = Some(now);
+                trigger.triggering_claim_id = Some(claim_id);
+                self.claim_triggers.insert(&trigger_id, &trigger);
+
+                self.env().emit_event(ClaimAutoPaid {
+                    trigger_id,
+                    claim_id,
+                    policy_id: trigger.policy_id,
+                    payout_amount: payout,
+                    timestamp: now,
+                });
+
+                Ok(Some(claim_id))
+            })
+        }
+
+        /// Get claim trigger by id.
+        #[ink(message)]
+        pub fn get_claim_trigger(&self, trigger_id: u64) -> Option<ClaimTrigger> {
+            self.claim_triggers.get(&trigger_id)
+        }
+
+        /// Get all trigger ids registered against a policy.
+        #[ink(message)]
+        pub fn get_policy_triggers(&self, policy_id: u64) -> Vec<u64> {
+            self.policy_triggers.get(&policy_id).unwrap_or_default()
+        }
+
+        /// Total number of triggers ever registered.
+        #[ink(message)]
+        pub fn get_trigger_count(&self) -> u64 {
+            self.trigger_count
+        }
+
+        // =====================================================================
         // REINSURANCE
         // =====================================================================
 
@@ -1238,6 +1547,51 @@ mod propchain_insurance {
             Ok(())
         }
 
+        fn evaluate_condition(
+            comparator: &TriggerComparator,
+            observed: u128,
+            threshold: u128,
+        ) -> bool {
+            match comparator {
+                TriggerComparator::GreaterOrEqual => observed >= threshold,
+                TriggerComparator::LessOrEqual => observed <= threshold,
+            }
+        }
+
+        fn compute_claim_amount(
+            mode: &PayoutMode,
+            remaining_coverage: u128,
+        ) -> Result<u128, InsuranceError> {
+            let amount = match mode {
+                PayoutMode::Fixed(v) => (*v).min(remaining_coverage),
+                PayoutMode::PercentBps(bps) => {
+                    if *bps == 0 || *bps > 10_000 {
+                        return Err(InsuranceError::InvalidPayoutMode);
+                    }
+                    remaining_coverage.saturating_mul(*bps as u128) / 10_000
+                }
+                PayoutMode::FullCoverage => remaining_coverage,
+            };
+            Ok(amount)
+        }
+
+        fn ensure_payout_mode_valid(mode: &PayoutMode) -> Result<(), InsuranceError> {
+            match mode {
+                PayoutMode::Fixed(v) => {
+                    if *v == 0 {
+                        return Err(InsuranceError::InvalidPayoutMode);
+                    }
+                }
+                PayoutMode::PercentBps(bps) => {
+                    if *bps == 0 || *bps > 10_000 {
+                        return Err(InsuranceError::InvalidPayoutMode);
+                    }
+                }
+                PayoutMode::FullCoverage => {}
+            }
+            Ok(())
+        }
+
         fn try_reinsurance_recovery(
             &mut self,
             claim_id: u64,
@@ -1285,5 +1639,8 @@ mod propchain_insurance {
 }
 
 pub use crate::propchain_insurance::{InsuranceError, PropertyInsurance};
+
+#[cfg(test)]
+mod tests;
 
 // Unit tests extracted to tests.rs (Issue #101)

@@ -240,3 +240,90 @@ pub struct PoolLiquidityProvider {
     pub last_reward_claim: u64,
     pub accumulated_rewards: u128,
 }
+
+// =========================================================================
+// CLAIM AUTOMATION (oracle-triggered parametric claims)
+// =========================================================================
+
+/// Metric type an oracle can report against. Units are policy-specific and
+/// must match what the oracle is configured to publish (e.g. wind speed in
+/// km/h, magnitude * 100, etc.).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum TriggerMetric {
+    WindSpeed,
+    FloodLevel,
+    EarthquakeMagnitude,
+    Temperature,
+    Generic,
+}
+
+/// How the observed value is compared to the threshold.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum TriggerComparator {
+    GreaterOrEqual,
+    LessOrEqual,
+}
+
+/// How the gross claim amount is computed once a trigger fires.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum PayoutMode {
+    /// Fixed payout amount, capped at remaining coverage.
+    Fixed(u128),
+    /// Percentage of remaining coverage, in basis points (0–10000).
+    PercentBps(u32),
+    /// Pay out the full remaining coverage.
+    FullCoverage,
+}
+
+/// A condition registered against a policy. When an authorized oracle reports
+/// a value that satisfies the comparator/threshold, a claim is automatically
+/// created, approved, and paid.
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ClaimTrigger {
+    pub trigger_id: u64,
+    pub policy_id: u64,
+    pub metric: TriggerMetric,
+    pub comparator: TriggerComparator,
+    pub threshold: u128,
+    pub payout_mode: PayoutMode,
+    pub is_active: bool,
+    pub triggered: bool,
+    pub last_observed_value: Option<u128>,
+    pub last_report_url: String,
+    pub created_at: u64,
+    pub triggered_at: Option<u64>,
+    pub triggering_claim_id: Option<u64>,
+}

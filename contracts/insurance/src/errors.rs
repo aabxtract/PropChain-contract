@@ -23,4 +23,9 @@ pub enum InsuranceError {
     PropertyNotInsurable,
     DuplicateClaim,
     ReentrantCall,
+    TriggerNotFound,
+    TriggerInactive,
+    TriggerAlreadyFired,
+    TriggerConditionNotMet,
+    InvalidPayoutMode,
 }
