@@ -853,4 +853,255 @@ mod insurance_tests {
         let holder_policies = contract.get_policyholder_policies(accounts.bob);
         assert_eq!(holder_policies.len(), 2);
     }
+
+    // =========================================================================
+    // DISPUTE RESOLUTION TESTS (Issue #255)
+    // =========================================================================
+
+    use crate::propchain_insurance::{DisputeOutcome, DisputeStatus};
+
+    /// Helper: set up a contract with a pool, policy, and a rejected claim.
+    fn setup_rejected_claim() -> (PropertyInsurance, u64, u64) {
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        test::set_block_timestamp::<DefaultEnvironment>(3_000_000);
+        let mut contract = PropertyInsurance::new(accounts.alice);
+
+        // Pool
+        let pool_id = contract
+            .create_risk_pool("Test Pool".into(), CoverageType::Fire, 8000, 500_000_000_000u128)
+            .unwrap();
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.provide_pool_liquidity(pool_id).unwrap();
+
+        // Risk assessment
+        contract
+            .update_risk_assessment(1, 75, 80, 85, 90, 86_400 * 365)
+            .unwrap();
+
+        // Policy (bob)
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        let policy_id = contract
+            .create_policy(
+                1,
+                CoverageType::Fire,
+                500_000_000_000u128,
+                pool_id,
+                86_400 * 365,
+                "ipfs://test".into(),
+            )
+            .unwrap();
+
+        // Claim (bob)
+        test::set_value_transferred::<DefaultEnvironment>(0);
+        let claim_id = contract
+            .submit_claim(policy_id, 1_000_000u128, "Damage".into(), "ipfs://e".into())
+            .unwrap();
+
+        // Reject the claim (alice as admin)
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract
+            .process_claim(claim_id, false, "ipfs://r".into(), "Insufficient evidence".into())
+            .unwrap();
+
+        (contract, claim_id, policy_id)
+    }
+
+    #[ink::test]
+    fn test_raise_dispute_works() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let result = contract.raise_dispute(claim_id, "Evidence was valid".into());
+        assert!(result.is_ok());
+        let dispute_id = result.unwrap();
+        assert_eq!(dispute_id, 1);
+        assert_eq!(contract.get_dispute_count(), 1);
+
+        let dispute = contract.get_dispute(dispute_id).unwrap();
+        assert_eq!(dispute.claim_id, claim_id);
+        assert_eq!(dispute.claimant, accounts.bob);
+        assert_eq!(dispute.status, DisputeStatus::Open);
+        assert!(dispute.outcome.is_none());
+
+        // Claim should now be Disputed
+        let claim = contract.get_claim(claim_id).unwrap();
+        assert_eq!(claim.status, ClaimStatus::Disputed);
+
+        // claim_dispute mapping populated
+        assert_eq!(contract.get_claim_dispute_id(claim_id), Some(dispute_id));
+    }
+
+    #[ink::test]
+    fn test_raise_dispute_non_claimant_fails() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        let result = contract.raise_dispute(claim_id, "Not my claim".into());
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
+    }
+
+    #[ink::test]
+    fn test_raise_dispute_on_non_rejected_claim_fails() {
+        let mut contract = setup();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+        let pool_id = contract
+            .create_risk_pool("Pool".into(), CoverageType::Fire, 8000, 500_000_000_000u128)
+            .unwrap();
+        test::set_value_transferred::<DefaultEnvironment>(10_000_000_000_000u128);
+        contract.provide_pool_liquidity(pool_id).unwrap();
+        add_risk_assessment(&mut contract, 1);
+        let calc = contract
+            .calculate_premium(1, 500_000_000_000u128, CoverageType::Fire)
+            .unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        test::set_value_transferred::<DefaultEnvironment>(calc.annual_premium * 2);
+        let policy_id = contract
+            .create_policy(1, CoverageType::Fire, 500_000_000_000u128, pool_id, 86_400 * 365, "ipfs://t".into())
+            .unwrap();
+        test::set_value_transferred::<DefaultEnvironment>(0);
+        let claim_id = contract
+            .submit_claim(policy_id, 1_000_000u128, "Damage".into(), "ipfs://e".into())
+            .unwrap();
+        // Claim is Pending, not Rejected
+        let result = contract.raise_dispute(claim_id, "reason".into());
+        assert_eq!(result, Err(InsuranceError::ClaimNotRejected));
+    }
+
+    #[ink::test]
+    fn test_raise_duplicate_dispute_fails() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        contract.raise_dispute(claim_id, "First".into()).unwrap();
+        let result = contract.raise_dispute(claim_id, "Second".into());
+        assert_eq!(result, Err(InsuranceError::DisputeAlreadyExists));
+    }
+
+    #[ink::test]
+    fn test_vote_on_dispute_works() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let dispute_id = contract.raise_dispute(claim_id, "Evidence valid".into()).unwrap();
+
+        // Alice (admin) votes for claimant
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        assert!(contract.vote_on_dispute(dispute_id, true).is_ok());
+        let dispute = contract.get_dispute(dispute_id).unwrap();
+        assert_eq!(dispute.votes_for_claimant, 1);
+        assert_eq!(dispute.votes_for_insurer, 0);
+
+        // Charlie (assessor) votes for insurer
+        contract.authorize_assessor(accounts.charlie).unwrap();
+        test::set_caller::<DefaultEnvironment>(accounts.charlie);
+        assert!(contract.vote_on_dispute(dispute_id, false).is_ok());
+        let dispute = contract.get_dispute(dispute_id).unwrap();
+        assert_eq!(dispute.votes_for_insurer, 1);
+    }
+
+    #[ink::test]
+    fn test_vote_unauthorized_fails() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let dispute_id = contract.raise_dispute(claim_id, "reason".into()).unwrap();
+
+        // Bob is not an assessor
+        let result = contract.vote_on_dispute(dispute_id, true);
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
+    }
+
+    #[ink::test]
+    fn test_double_vote_fails() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let dispute_id = contract.raise_dispute(claim_id, "reason".into()).unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.vote_on_dispute(dispute_id, true).unwrap();
+        let result = contract.vote_on_dispute(dispute_id, false);
+        assert_eq!(result, Err(InsuranceError::AlreadyVoted));
+    }
+
+    #[ink::test]
+    fn test_resolve_dispute_claimant_wins() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let dispute_id = contract.raise_dispute(claim_id, "Evidence valid".into()).unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let result = contract.resolve_dispute(dispute_id, DisputeOutcome::ClaimantWins);
+        assert!(result.is_ok());
+
+        let dispute = contract.get_dispute(dispute_id).unwrap();
+        assert_eq!(dispute.status, DisputeStatus::Resolved);
+        assert_eq!(dispute.outcome, Some(DisputeOutcome::ClaimantWins));
+
+        // Claim should be Approved (or Paid after payout)
+        let claim = contract.get_claim(claim_id).unwrap();
+        assert!(
+            claim.status == ClaimStatus::Approved || claim.status == ClaimStatus::Paid,
+            "expected Approved or Paid, got {:?}", claim.status
+        );
+    }
+
+    #[ink::test]
+    fn test_resolve_dispute_insurer_wins() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let dispute_id = contract.raise_dispute(claim_id, "reason".into()).unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        let result = contract.resolve_dispute(dispute_id, DisputeOutcome::InsurerWins);
+        assert!(result.is_ok());
+
+        let dispute = contract.get_dispute(dispute_id).unwrap();
+        assert_eq!(dispute.outcome, Some(DisputeOutcome::InsurerWins));
+
+        let claim = contract.get_claim(claim_id).unwrap();
+        assert_eq!(claim.status, ClaimStatus::Rejected);
+    }
+
+    #[ink::test]
+    fn test_resolve_dispute_unauthorized_fails() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let dispute_id = contract.raise_dispute(claim_id, "reason".into()).unwrap();
+
+        // Bob is not admin
+        let result = contract.resolve_dispute(dispute_id, DisputeOutcome::ClaimantWins);
+        assert_eq!(result, Err(InsuranceError::Unauthorized));
+    }
+
+    #[ink::test]
+    fn test_resolve_already_resolved_dispute_fails() {
+        let (mut contract, claim_id, _) = setup_rejected_claim();
+        let accounts = test::default_accounts::<DefaultEnvironment>();
+
+        test::set_caller::<DefaultEnvironment>(accounts.bob);
+        let dispute_id = contract.raise_dispute(claim_id, "reason".into()).unwrap();
+
+        test::set_caller::<DefaultEnvironment>(accounts.alice);
+        contract.resolve_dispute(dispute_id, DisputeOutcome::InsurerWins).unwrap();
+        let result = contract.resolve_dispute(dispute_id, DisputeOutcome::ClaimantWins);
+        assert_eq!(result, Err(InsuranceError::DisputeNotOpen));
+    }
 }

@@ -86,6 +86,14 @@ mod propchain_insurance {
 
         // Reentrancy protection
         reentrancy_guard: ReentrancyGuard,
+
+        // ── Dispute resolution (Issue #255) ──────────────────────────────────
+        disputes: Mapping<u64, ClaimDispute>,
+        dispute_count: u64,
+        /// claim_id → dispute_id (one dispute per claim)
+        claim_dispute: Mapping<u64, u64>,
+        /// dispute_id → set of voters (to prevent double-voting)
+        dispute_voters: Mapping<(u64, AccountId), bool>,
     }
 
     // =========================================================================
@@ -210,6 +218,38 @@ mod propchain_insurance {
         timestamp: u64,
     }
 
+    // ── Dispute resolution events (Issue #255) ────────────────────────────────
+
+    #[ink(event)]
+    pub struct DisputeRaised {
+        #[ink(topic)]
+        dispute_id: u64,
+        #[ink(topic)]
+        claim_id: u64,
+        #[ink(topic)]
+        claimant: AccountId,
+        timestamp: u64,
+    }
+
+    #[ink(event)]
+    pub struct DisputeVoteCast {
+        #[ink(topic)]
+        dispute_id: u64,
+        voter: AccountId,
+        in_favour_of_claimant: bool,
+    }
+
+    #[ink(event)]
+    pub struct DisputeResolved {
+        #[ink(topic)]
+        dispute_id: u64,
+        #[ink(topic)]
+        claim_id: u64,
+        outcome: DisputeOutcome,
+        resolved_by: AccountId,
+        timestamp: u64,
+    }
+
     // =========================================================================
     // IMPLEMENTATION
     // =========================================================================
@@ -246,6 +286,11 @@ mod propchain_insurance {
                 claim_cooldown_period: 2_592_000,  // 30 days in seconds
                 min_pool_capital: 100_000_000_000, // Minimum pool capital
                 reentrancy_guard: ReentrancyGuard::new(),
+                // Dispute resolution (Issue #255)
+                disputes: Mapping::default(),
+                dispute_count: 0,
+                claim_dispute: Mapping::default(),
+                dispute_voters: Mapping::default(),
             }
         }
 
@@ -957,6 +1002,217 @@ mod propchain_insurance {
         }
 
         // =====================================================================
+        // DISPUTE RESOLUTION (Issue #255)
+        // =====================================================================
+
+        /// Raise a dispute against a rejected claim.
+        ///
+        /// Only the original claimant may dispute, and only when the claim
+        /// status is `Rejected`. Each claim may have at most one open dispute.
+        #[ink(message)]
+        pub fn raise_dispute(
+            &mut self,
+            claim_id: u64,
+            reason: String,
+        ) -> Result<u64, InsuranceError> {
+            let caller = self.env().caller();
+            let mut claim = self
+                .claims
+                .get(&claim_id)
+                .ok_or(InsuranceError::ClaimNotFound)?;
+
+            if claim.claimant != caller {
+                return Err(InsuranceError::Unauthorized);
+            }
+            if claim.status != ClaimStatus::Rejected {
+                return Err(InsuranceError::ClaimNotRejected);
+            }
+            if self.claim_dispute.get(&claim_id).is_some() {
+                return Err(InsuranceError::DisputeAlreadyExists);
+            }
+
+            let dispute_id = self.dispute_count + 1;
+            self.dispute_count = dispute_id;
+
+            let now = self.env().block_timestamp();
+            let dispute = ClaimDispute {
+                dispute_id,
+                claim_id,
+                claimant: caller,
+                reason,
+                status: DisputeStatus::Open,
+                outcome: None,
+                votes_for_claimant: 0,
+                votes_for_insurer: 0,
+                raised_at: now,
+                resolved_at: None,
+                resolved_by: None,
+            };
+
+            self.disputes.insert(&dispute_id, &dispute);
+            self.claim_dispute.insert(&claim_id, &dispute_id);
+
+            // Mark claim as disputed
+            claim.status = ClaimStatus::Disputed;
+            self.claims.insert(&claim_id, &claim);
+
+            self.env().emit_event(DisputeRaised {
+                dispute_id,
+                claim_id,
+                claimant: caller,
+                timestamp: now,
+            });
+
+            Ok(dispute_id)
+        }
+
+        /// Cast a vote on an open dispute.
+        ///
+        /// Only authorized assessors or the admin may vote. Each address may
+        /// vote only once per dispute.
+        #[ink(message)]
+        pub fn vote_on_dispute(
+            &mut self,
+            dispute_id: u64,
+            in_favour_of_claimant: bool,
+        ) -> Result<(), InsuranceError> {
+            let caller = self.env().caller();
+            if caller != self.admin
+                && !self.authorized_assessors.get(&caller).unwrap_or(false)
+            {
+                return Err(InsuranceError::Unauthorized);
+            }
+
+            let mut dispute = self
+                .disputes
+                .get(&dispute_id)
+                .ok_or(InsuranceError::DisputeNotFound)?;
+
+            if dispute.status != DisputeStatus::Open {
+                return Err(InsuranceError::DisputeNotOpen);
+            }
+
+            let voter_key = (dispute_id, caller);
+            if self.dispute_voters.get(&voter_key).unwrap_or(false) {
+                return Err(InsuranceError::AlreadyVoted);
+            }
+            self.dispute_voters.insert(&voter_key, &true);
+
+            if in_favour_of_claimant {
+                dispute.votes_for_claimant += 1;
+            } else {
+                dispute.votes_for_insurer += 1;
+            }
+            self.disputes.insert(&dispute_id, &dispute);
+
+            self.env().emit_event(DisputeVoteCast {
+                dispute_id,
+                voter: caller,
+                in_favour_of_claimant,
+            });
+
+            Ok(())
+        }
+
+        /// Resolve an open dispute (admin only).
+        ///
+        /// The admin calls this to close voting and apply the outcome.
+        /// If `ClaimantWins`, the claim is re-approved and the payout executed.
+        /// If `InsurerWins`, the claim remains rejected.
+        #[ink(message)]
+        pub fn resolve_dispute(
+            &mut self,
+            dispute_id: u64,
+            outcome: DisputeOutcome,
+        ) -> Result<(), InsuranceError> {
+            non_reentrant!(self, {
+                self.ensure_admin()?;
+
+                let mut dispute = self
+                    .disputes
+                    .get(&dispute_id)
+                    .ok_or(InsuranceError::DisputeNotFound)?;
+
+                if dispute.status != DisputeStatus::Open {
+                    return Err(InsuranceError::DisputeNotOpen);
+                }
+
+                let now = self.env().block_timestamp();
+                let caller = self.env().caller();
+
+                dispute.status = DisputeStatus::Resolved;
+                dispute.outcome = Some(outcome.clone());
+                dispute.resolved_at = Some(now);
+                dispute.resolved_by = Some(caller);
+                self.disputes.insert(&dispute_id, &dispute);
+
+                if outcome == DisputeOutcome::ClaimantWins {
+                    let mut claim = self
+                        .claims
+                        .get(&dispute.claim_id)
+                        .ok_or(InsuranceError::ClaimNotFound)?;
+
+                    let policy = self
+                        .policies
+                        .get(&claim.policy_id)
+                        .ok_or(InsuranceError::PolicyNotFound)?;
+
+                    let payout = if claim.claim_amount > policy.deductible {
+                        claim.claim_amount.saturating_sub(policy.deductible)
+                    } else {
+                        0
+                    };
+
+                    claim.payout_amount = payout;
+                    claim.status = ClaimStatus::Approved;
+                    claim.processed_at = Some(now);
+                    claim.assessor = Some(caller);
+                    self.claims.insert(&dispute.claim_id, &claim);
+
+                    self.execute_payout(dispute.claim_id, claim.policy_id, claim.claimant, payout)?;
+                } else {
+                    // Insurer wins — keep claim rejected
+                    let mut claim = self
+                        .claims
+                        .get(&dispute.claim_id)
+                        .ok_or(InsuranceError::ClaimNotFound)?;
+                    claim.status = ClaimStatus::Rejected;
+                    self.claims.insert(&dispute.claim_id, &claim);
+                }
+
+                self.env().emit_event(DisputeResolved {
+                    dispute_id,
+                    claim_id: dispute.claim_id,
+                    outcome,
+                    resolved_by: caller,
+                    timestamp: now,
+                });
+
+                Ok(())
+            })
+        }
+
+        // ── Dispute queries ───────────────────────────────────────────────────
+
+        /// Get a dispute by ID.
+        #[ink(message)]
+        pub fn get_dispute(&self, dispute_id: u64) -> Option<ClaimDispute> {
+            self.disputes.get(&dispute_id)
+        }
+
+        /// Get the dispute ID for a claim (if any).
+        #[ink(message)]
+        pub fn get_claim_dispute_id(&self, claim_id: u64) -> Option<u64> {
+            self.claim_dispute.get(&claim_id)
+        }
+
+        /// Get total dispute count.
+        #[ink(message)]
+        pub fn get_dispute_count(&self) -> u64 {
+            self.dispute_count
+        }
+
+        // =====================================================================
         // ADMIN / AUTHORITY MANAGEMENT
         // =====================================================================
 
@@ -1287,3 +1543,5 @@ mod propchain_insurance {
 pub use crate::propchain_insurance::{InsuranceError, PropertyInsurance};
 
 // Unit tests extracted to tests.rs (Issue #101)
+#[path = "tests.rs"]
+mod insurance_tests_module;

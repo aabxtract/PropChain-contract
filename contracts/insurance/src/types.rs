@@ -1,4 +1,59 @@
 // Data types for the insurance contract (Issue #101 - extracted from lib.rs)
+// Dispute resolution types added for Issue #255
+
+/// Lifecycle status of a claim dispute.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum DisputeStatus {
+    Open,
+    Resolved,
+    Dismissed,
+}
+
+/// Outcome of a resolved dispute.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum DisputeOutcome {
+    /// Original rejection overturned; claim approved and paid.
+    ClaimantWins,
+    /// Original decision upheld; claim stays rejected.
+    InsurerWins,
+}
+
+/// A dispute raised against a rejected insurance claim.
+#[derive(
+    Debug, Clone, PartialEq, scale::Encode, scale::Decode, ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ClaimDispute {
+    pub dispute_id: u64,
+    pub claim_id: u64,
+    pub claimant: AccountId,
+    pub reason: String,
+    pub status: DisputeStatus,
+    pub outcome: Option<DisputeOutcome>,
+    pub votes_for_claimant: u32,
+    pub votes_for_insurer: u32,
+    pub raised_at: u64,
+    pub resolved_at: Option<u64>,
+    pub resolved_by: Option<AccountId>,
+}
 
 #[derive(
     Debug,

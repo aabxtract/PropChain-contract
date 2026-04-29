@@ -23,4 +23,10 @@ pub enum InsuranceError {
     PropertyNotInsurable,
     DuplicateClaim,
     ReentrantCall,
+    // Dispute resolution errors (Issue #255)
+    DisputeNotFound,
+    DisputeAlreadyExists,
+    DisputeNotOpen,
+    AlreadyVoted,
+    ClaimNotRejected,
 }
