@@ -57,3 +57,63 @@ pub struct StakeInfo {
     pub reward_debt: u128,
     pub governance_delegate: Option<AccountId>,
 }
+
+/// A staking parameter that stakers can vote to change.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum ParamKind {
+    MinStake(u128),
+    RewardRateBps(u128),
+    VotingPeriodBlocks(u64),
+    QuorumBps(u32),
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub enum ProposalStatus {
+    Active,
+    Executed,
+    Rejected,
+    Cancelled,
+}
+
+/// A proposal to change a staking parameter, voted on by stakers.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    scale::Encode,
+    scale::Decode,
+    ink::storage::traits::StorageLayout,
+)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct ParamProposal {
+    pub id: u64,
+    pub proposer: AccountId,
+    pub kind: ParamKind,
+    pub votes_for: u128,
+    pub votes_against: u128,
+    pub voting_end: u64,
+    pub total_power_snapshot: u128,
+    pub status: ProposalStatus,
+    pub created_at: u64,
+}

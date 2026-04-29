@@ -223,4 +223,301 @@ mod tests {
         assert!(LockPeriod::NinetyDays.multiplier() > LockPeriod::ThirtyDays.multiplier());
         assert!(LockPeriod::OneYear.multiplier() > LockPeriod::NinetyDays.multiplier());
     }
+
+    // ----- Parameter governance -----
+
+    fn end_voting_period(staking: &Staking) {
+        let (period, _) = staking.get_voting_config();
+        advance_block(period as u32 + 1);
+    }
+
+    #[ink::test]
+    fn propose_requires_voting_power() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        assert_eq!(
+            staking.propose_param_change(ParamKind::MinStake(2_000)),
+            Err(Error::NoVotingPower),
+        );
+    }
+
+    #[ink::test]
+    fn propose_param_change_records_proposal() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_000))
+            .unwrap();
+        assert_eq!(id, 0);
+        let p = staking.get_param_proposal(0).unwrap();
+        assert_eq!(p.kind, ParamKind::MinStake(2_000));
+        assert_eq!(p.status, ProposalStatus::Active);
+        assert_eq!(p.total_power_snapshot, 10_000);
+    }
+
+    #[ink::test]
+    fn propose_invalid_param_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        assert_eq!(
+            staking.propose_param_change(ParamKind::MinStake(0)),
+            Err(Error::InvalidConfig),
+        );
+        assert_eq!(
+            staking.propose_param_change(ParamKind::QuorumBps(20_000)),
+            Err(Error::InvalidConfig),
+        );
+    }
+
+    #[ink::test]
+    fn vote_weight_uses_governance_power() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+
+        let id = staking
+            .propose_param_change(ParamKind::RewardRateBps(750))
+            .unwrap();
+        staking.vote_on_proposal(id, true).unwrap();
+
+        let p = staking.get_param_proposal(id).unwrap();
+        assert_eq!(p.votes_for, 10_000);
+        assert_eq!(p.votes_against, 0);
+        assert!(staking.has_voted(id, accounts.bob));
+    }
+
+    #[ink::test]
+    fn double_vote_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        let id = staking
+            .propose_param_change(ParamKind::RewardRateBps(750))
+            .unwrap();
+        staking.vote_on_proposal(id, true).unwrap();
+        assert_eq!(staking.vote_on_proposal(id, false), Err(Error::AlreadyVoted));
+    }
+
+    #[ink::test]
+    fn vote_without_power_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        let id = staking
+            .propose_param_change(ParamKind::RewardRateBps(750))
+            .unwrap();
+
+        set_caller(accounts.charlie);
+        assert_eq!(staking.vote_on_proposal(id, true), Err(Error::NoVotingPower));
+    }
+
+    #[ink::test]
+    fn execute_applies_winning_proposal() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_500))
+            .unwrap();
+        staking.vote_on_proposal(id, true).unwrap();
+
+        end_voting_period(&staking);
+        staking.execute_param_proposal(id).unwrap();
+
+        assert_eq!(staking.get_min_stake(), 2_500);
+        let p = staking.get_param_proposal(id).unwrap();
+        assert_eq!(p.status, ProposalStatus::Executed);
+    }
+
+    #[ink::test]
+    fn execute_before_voting_end_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_500))
+            .unwrap();
+        staking.vote_on_proposal(id, true).unwrap();
+        assert_eq!(
+            staking.execute_param_proposal(id),
+            Err(Error::VotingActive),
+        );
+    }
+
+    #[ink::test]
+    fn vote_after_voting_end_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_500))
+            .unwrap();
+        end_voting_period(&staking);
+        assert_eq!(staking.vote_on_proposal(id, true), Err(Error::VotingEnded));
+    }
+
+    #[ink::test]
+    fn execute_quorum_not_reached_rejects() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        // Two stakers; only one of them votes. Quorum is 10% of total stake
+        // so a single voter with > 10% of the supply still meets quorum —
+        // pick weights so quorum is missed instead.
+        set_caller(accounts.bob);
+        staking.stake(1_000, LockPeriod::Flexible).unwrap();
+        set_caller(accounts.charlie);
+        staking.stake(1_000_000, LockPeriod::Flexible).unwrap();
+
+        set_caller(accounts.bob);
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_500))
+            .unwrap();
+        staking.vote_on_proposal(id, true).unwrap();
+
+        end_voting_period(&staking);
+        assert_eq!(
+            staking.execute_param_proposal(id),
+            Err(Error::QuorumNotReached),
+        );
+
+        let p = staking.get_param_proposal(id).unwrap();
+        assert_eq!(p.status, ProposalStatus::Rejected);
+        // Original min_stake unchanged.
+        assert_eq!(staking.get_min_stake(), 1_000);
+    }
+
+    #[ink::test]
+    fn execute_majority_against_rejects() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        set_caller(accounts.charlie);
+        staking.stake(20_000, LockPeriod::Flexible).unwrap();
+
+        set_caller(accounts.bob);
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(5_000))
+            .unwrap();
+        staking.vote_on_proposal(id, true).unwrap();
+
+        set_caller(accounts.charlie);
+        staking.vote_on_proposal(id, false).unwrap();
+
+        end_voting_period(&staking);
+        // No quorum failure: Ok(()) but proposal rejected and parameter unchanged.
+        staking.execute_param_proposal(id).unwrap();
+        let p = staking.get_param_proposal(id).unwrap();
+        assert_eq!(p.status, ProposalStatus::Rejected);
+        assert_eq!(staking.get_min_stake(), 1_000);
+    }
+
+    #[ink::test]
+    fn execute_twice_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_500))
+            .unwrap();
+        staking.vote_on_proposal(id, true).unwrap();
+        end_voting_period(&staking);
+        staking.execute_param_proposal(id).unwrap();
+        assert_eq!(
+            staking.execute_param_proposal(id),
+            Err(Error::ProposalClosed),
+        );
+    }
+
+    #[ink::test]
+    fn cancel_by_proposer_succeeds() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_500))
+            .unwrap();
+        staking.cancel_param_proposal(id).unwrap();
+        let p = staking.get_param_proposal(id).unwrap();
+        assert_eq!(p.status, ProposalStatus::Cancelled);
+    }
+
+    #[ink::test]
+    fn cancel_by_outsider_fails() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_500))
+            .unwrap();
+        set_caller(accounts.charlie);
+        assert_eq!(
+            staking.cancel_param_proposal(id),
+            Err(Error::Unauthorized),
+        );
+    }
+
+    #[ink::test]
+    fn voting_period_can_be_governed() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+
+        let id = staking
+            .propose_param_change(ParamKind::VotingPeriodBlocks(100))
+            .unwrap();
+        staking.vote_on_proposal(id, true).unwrap();
+        end_voting_period(&staking);
+        staking.execute_param_proposal(id).unwrap();
+
+        assert_eq!(staking.get_voting_config().0, 100);
+    }
+
+    #[ink::test]
+    fn delegate_can_vote_with_full_power() {
+        let mut staking = create_staking();
+        let accounts = default_accounts();
+
+        set_caller(accounts.bob);
+        staking.stake(10_000, LockPeriod::Flexible).unwrap();
+        staking.delegate_governance(accounts.charlie).unwrap();
+
+        // Bob has no power any more.
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_000))
+            .ok();
+        assert!(id.is_none());
+
+        // Charlie now holds Bob's power and can drive the proposal.
+        set_caller(accounts.charlie);
+        let id = staking
+            .propose_param_change(ParamKind::MinStake(2_000))
+            .unwrap();
+        staking.vote_on_proposal(id, true).unwrap();
+        end_voting_period(&staking);
+        staking.execute_param_proposal(id).unwrap();
+
+        assert_eq!(staking.get_min_stake(), 2_000);
+    }
 }

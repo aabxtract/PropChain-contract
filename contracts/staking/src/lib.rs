@@ -16,6 +16,14 @@ mod staking {
         }
     }
 
+    // Defaults for the on-chain governance module. They are themselves
+    // changeable via parameter proposals (ParamKind::VotingPeriodBlocks /
+    // QuorumBps), so any clearly-wrong choice here can be voted out.
+    const DEFAULT_VOTING_PERIOD_BLOCKS: u64 = 28_800; // ~2 days at 6s blocks
+    const DEFAULT_QUORUM_BPS: u32 = 1_000; // 10%
+    const MAX_ACTIVE_PARAM_PROPOSALS: u32 = 50;
+    const BPS_DENOMINATOR: u32 = 10_000;
+
     // =========================================================================
     // Events
     // =========================================================================
@@ -66,6 +74,46 @@ mod staking {
         pub reward_rate_bps: u128,
     }
 
+    #[ink(event)]
+    pub struct ParamProposalCreated {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        #[ink(topic)]
+        pub proposer: AccountId,
+        pub kind: ParamKind,
+        pub voting_end: u64,
+    }
+
+    #[ink(event)]
+    pub struct ParamVoteCast {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        #[ink(topic)]
+        pub voter: AccountId,
+        pub support: bool,
+        pub weight: u128,
+    }
+
+    #[ink(event)]
+    pub struct ParamProposalExecuted {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        pub kind: ParamKind,
+        pub executed_at: u64,
+    }
+
+    #[ink(event)]
+    pub struct ParamProposalRejected {
+        #[ink(topic)]
+        pub proposal_id: u64,
+    }
+
+    #[ink(event)]
+    pub struct ParamProposalCancelled {
+        #[ink(topic)]
+        pub proposal_id: u64,
+    }
+
     // =========================================================================
     // Storage
     // =========================================================================
@@ -83,6 +131,13 @@ mod staking {
         governance_power: Mapping<AccountId, u128>,
         staker_list: Vec<AccountId>,
         reentrancy_guard: propchain_traits::ReentrancyGuard,
+        // ----- Parameter governance -----
+        proposal_counter: u64,
+        active_proposal_count: u32,
+        param_proposals: Mapping<u64, ParamProposal>,
+        param_votes: Mapping<(u64, AccountId), bool>,
+        voting_period_blocks: u64,
+        quorum_bps: u32,
     }
 
     // =========================================================================
@@ -116,6 +171,12 @@ mod staking {
                 governance_power: Mapping::default(),
                 staker_list: Vec::new(),
                 reentrancy_guard: propchain_traits::ReentrancyGuard::new(),
+                proposal_counter: 0,
+                active_proposal_count: 0,
+                param_proposals: Mapping::default(),
+                param_votes: Mapping::default(),
+                voting_period_blocks: DEFAULT_VOTING_PERIOD_BLOCKS,
+                quorum_bps: DEFAULT_QUORUM_BPS,
             }
         }
 
@@ -351,6 +412,206 @@ mod staking {
             Ok(())
         }
 
+        // ----- Parameter governance -----
+
+        /// Returns the current voting period (in blocks) and quorum (in bps).
+        #[ink(message)]
+        pub fn get_voting_config(&self) -> (u64, u32) {
+            (self.voting_period_blocks, self.quorum_bps)
+        }
+
+        /// Returns a parameter proposal by id, if any.
+        #[ink(message)]
+        pub fn get_param_proposal(&self, proposal_id: u64) -> Option<ParamProposal> {
+            self.param_proposals.get(proposal_id)
+        }
+
+        /// Total number of parameter proposals ever created.
+        #[ink(message)]
+        pub fn get_proposal_count(&self) -> u64 {
+            self.proposal_counter
+        }
+
+        /// Whether `voter` has already voted on `proposal_id`.
+        #[ink(message)]
+        pub fn has_voted(&self, proposal_id: u64, voter: AccountId) -> bool {
+            self.param_votes.contains((proposal_id, voter))
+        }
+
+        /// Propose a change to a staking parameter. Caller must hold governance
+        /// power (i.e. be a staker or hold delegated power).
+        #[ink(message)]
+        pub fn propose_param_change(&mut self, kind: ParamKind) -> Result<u64, Error> {
+            let caller = self.env().caller();
+            if self.governance_power.get(caller).unwrap_or(0) == 0 {
+                return Err(Error::NoVotingPower);
+            }
+            if self.active_proposal_count >= MAX_ACTIVE_PARAM_PROPOSALS {
+                return Err(Error::TooManyProposals);
+            }
+            Self::validate_param(&kind)?;
+
+            let now = self.env().block_number() as u64;
+            let proposal_id = self.proposal_counter;
+            self.proposal_counter = self.proposal_counter.saturating_add(1);
+
+            let proposal = ParamProposal {
+                id: proposal_id,
+                proposer: caller,
+                kind,
+                votes_for: 0,
+                votes_against: 0,
+                voting_end: now.saturating_add(self.voting_period_blocks),
+                total_power_snapshot: self.total_staked,
+                status: ProposalStatus::Active,
+                created_at: now,
+            };
+
+            self.param_proposals.insert(proposal_id, &proposal);
+            self.active_proposal_count = self.active_proposal_count.saturating_add(1);
+
+            self.env().emit_event(ParamProposalCreated {
+                proposal_id,
+                proposer: caller,
+                kind,
+                voting_end: proposal.voting_end,
+            });
+
+            Ok(proposal_id)
+        }
+
+        /// Cast a vote on an active parameter proposal, weighted by the
+        /// caller's current governance power.
+        #[ink(message)]
+        pub fn vote_on_proposal(
+            &mut self,
+            proposal_id: u64,
+            support: bool,
+        ) -> Result<(), Error> {
+            let caller = self.env().caller();
+            let weight = self.governance_power.get(caller).unwrap_or(0);
+            if weight == 0 {
+                return Err(Error::NoVotingPower);
+            }
+
+            let mut proposal = self
+                .param_proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            if proposal.status != ProposalStatus::Active {
+                return Err(Error::ProposalClosed);
+            }
+
+            let now = self.env().block_number() as u64;
+            if now >= proposal.voting_end {
+                return Err(Error::VotingEnded);
+            }
+
+            if self.param_votes.contains((proposal_id, caller)) {
+                return Err(Error::AlreadyVoted);
+            }
+            self.param_votes.insert((proposal_id, caller), &support);
+
+            if support {
+                proposal.votes_for = proposal.votes_for.saturating_add(weight);
+            } else {
+                proposal.votes_against = proposal.votes_against.saturating_add(weight);
+            }
+            self.param_proposals.insert(proposal_id, &proposal);
+
+            self.env().emit_event(ParamVoteCast {
+                proposal_id,
+                voter: caller,
+                support,
+                weight,
+            });
+
+            Ok(())
+        }
+
+        /// Finalise a proposal once its voting window has closed. If quorum is
+        /// reached and `votes_for > votes_against`, the parameter change is
+        /// applied; otherwise the proposal is rejected. Anyone may call.
+        #[ink(message)]
+        pub fn execute_param_proposal(&mut self, proposal_id: u64) -> Result<(), Error> {
+            let mut proposal = self
+                .param_proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            if proposal.status != ProposalStatus::Active {
+                return Err(Error::ProposalClosed);
+            }
+
+            let now = self.env().block_number() as u64;
+            if now < proposal.voting_end {
+                return Err(Error::VotingActive);
+            }
+
+            let total_votes = proposal.votes_for.saturating_add(proposal.votes_against);
+            let quorum_required = proposal
+                .total_power_snapshot
+                .saturating_mul(self.quorum_bps as u128)
+                / BPS_DENOMINATOR as u128;
+
+            self.active_proposal_count = self.active_proposal_count.saturating_sub(1);
+
+            if total_votes < quorum_required {
+                proposal.status = ProposalStatus::Rejected;
+                self.param_proposals.insert(proposal_id, &proposal);
+                self.env()
+                    .emit_event(ParamProposalRejected { proposal_id });
+                return Err(Error::QuorumNotReached);
+            }
+
+            if proposal.votes_for <= proposal.votes_against {
+                proposal.status = ProposalStatus::Rejected;
+                self.param_proposals.insert(proposal_id, &proposal);
+                self.env()
+                    .emit_event(ParamProposalRejected { proposal_id });
+                return Ok(());
+            }
+
+            self.apply_param(proposal.kind);
+            proposal.status = ProposalStatus::Executed;
+            self.param_proposals.insert(proposal_id, &proposal);
+
+            self.env().emit_event(ParamProposalExecuted {
+                proposal_id,
+                kind: proposal.kind,
+                executed_at: now,
+            });
+
+            Ok(())
+        }
+
+        /// Cancel an active proposal. Only the proposer or admin may cancel.
+        #[ink(message)]
+        pub fn cancel_param_proposal(&mut self, proposal_id: u64) -> Result<(), Error> {
+            let caller = self.env().caller();
+            let mut proposal = self
+                .param_proposals
+                .get(proposal_id)
+                .ok_or(Error::ProposalNotFound)?;
+
+            if proposal.status != ProposalStatus::Active {
+                return Err(Error::ProposalClosed);
+            }
+            if caller != proposal.proposer && caller != self.admin {
+                return Err(Error::Unauthorized);
+            }
+
+            proposal.status = ProposalStatus::Cancelled;
+            self.active_proposal_count = self.active_proposal_count.saturating_sub(1);
+            self.param_proposals.insert(proposal_id, &proposal);
+
+            self.env()
+                .emit_event(ParamProposalCancelled { proposal_id });
+
+            Ok(())
+        }
+
         // ----- Internal helpers -----
 
         fn ensure_admin(&self) -> Result<(), Error> {
@@ -380,6 +641,53 @@ mod staking {
             base_reward.saturating_mul(multiplier) / 100
         }
 
+        fn validate_param(kind: &ParamKind) -> Result<(), Error> {
+            match kind {
+                ParamKind::MinStake(v) => {
+                    if *v == 0 {
+                        return Err(Error::InvalidConfig);
+                    }
+                }
+                ParamKind::RewardRateBps(_) => {}
+                ParamKind::VotingPeriodBlocks(v) => {
+                    if *v == 0 {
+                        return Err(Error::InvalidConfig);
+                    }
+                }
+                ParamKind::QuorumBps(v) => {
+                    if *v == 0 || *v > BPS_DENOMINATOR {
+                        return Err(Error::InvalidConfig);
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn apply_param(&mut self, kind: ParamKind) {
+            match kind {
+                ParamKind::MinStake(v) => {
+                    self.min_stake = v;
+                    self.env().emit_event(StakingConfigUpdated {
+                        min_stake: self.min_stake,
+                        reward_rate_bps: self.reward_rate_bps,
+                    });
+                }
+                ParamKind::RewardRateBps(v) => {
+                    self.reward_rate_bps = v;
+                    self.env().emit_event(StakingConfigUpdated {
+                        min_stake: self.min_stake,
+                        reward_rate_bps: self.reward_rate_bps,
+                    });
+                }
+                ParamKind::VotingPeriodBlocks(v) => {
+                    self.voting_period_blocks = v;
+                }
+                ParamKind::QuorumBps(v) => {
+                    self.quorum_bps = v;
+                }
+            }
+        }
+
         fn remove_governance_power(&mut self, stake: &StakeInfo) {
             let power_holder = stake.governance_delegate.unwrap_or(stake.staker);
             let current = self.governance_power.get(power_holder).unwrap_or(0);
@@ -395,4 +703,5 @@ mod staking {
     // =========================================================================
     // Tests
     // =========================================================================
+    include!("tests.rs");
 }
