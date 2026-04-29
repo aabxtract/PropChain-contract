@@ -66,6 +66,8 @@ mod propchain_escrow {
         large_transfer_threshold: u128,
         /// Very-large-transfer threshold override (0 = use global constant)
         very_large_transfer_threshold: u128,
+        /// Tax compliance contract address
+        tax_compliance_contract: Option<AccountId>,
     }
 
     // Events
@@ -218,7 +220,7 @@ mod propchain_escrow {
     impl AdvancedEscrow {
         /// Constructor
         #[ink(constructor)]
-        pub fn new(min_high_value_threshold: u128) -> Self {
+        pub fn new(min_high_value_threshold: u128, tax_compliance_contract: Option<AccountId>) -> Self {
             Self {
                 escrows: Mapping::default(),
                 escrow_count: 0,
@@ -241,6 +243,7 @@ mod propchain_escrow {
                 // 0 means "use global constant from propchain_traits::constants"
                 large_transfer_threshold: 0,
                 very_large_transfer_threshold: 0,
+                tax_compliance_contract,
             }
         }
 
@@ -255,6 +258,7 @@ mod propchain_escrow {
             participants: Vec<AccountId>,
             required_signatures: u8,
             release_time_lock: Option<u64>,
+            jurisdiction: Jurisdiction,
         ) -> Result<u64, Error> {
             let caller = self.env().caller();
 
@@ -282,6 +286,7 @@ mod propchain_escrow {
                 created_at: self.env().block_timestamp(),
                 release_time_lock,
                 participants: participants.clone(),
+                jurisdiction,
             };
 
             self.escrows.insert(&escrow_id, &escrow_data);
@@ -430,10 +435,32 @@ mod propchain_escrow {
                 }
                 // ── End large-transfer gate ──────────────────────────────────
 
-                // Transfer funds to seller
+                // ── Tax Withholding ──────────────────────────────────────────
+                let mut final_transfer_amount = escrow.deposited_amount;
+                if let Some(tax_contract) = self.tax_compliance_contract {
+                    use ink::env::call::FromAccountId;
+                    let mut withholder: ink::contract_ref!(TaxWithholder) =
+                        FromAccountId::from_account_id(tax_contract);
+
+                    let (withheld_amount, collector) = withholder.withhold_tax(
+                        escrow.property_id,
+                        escrow.jurisdiction,
+                        escrow.deposited_amount,
+                    );
+
+                    if withheld_amount > 0 {
+                        if self.env().transfer(collector, withheld_amount).is_err() {
+                            return Err(Error::InsufficientFunds);
+                        }
+                        final_transfer_amount = final_transfer_amount.saturating_sub(withheld_amount);
+                    }
+                }
+                // ── End Tax Withholding ──────────────────────────────────────
+
+                // Transfer remaining funds to seller
                 if self
                     .env()
-                    .transfer(escrow.seller, escrow.deposited_amount)
+                    .transfer(escrow.seller, final_transfer_amount)
                     .is_err()
                 {
                     return Err(Error::InsufficientFunds);
@@ -794,6 +821,15 @@ mod propchain_escrow {
             Ok(())
         }
 
+        #[ink(message)]
+        pub fn set_tax_compliance_contract(&mut self, contract: Option<AccountId>) -> Result<(), Error> {
+            if self.env().caller() != self.admin {
+                return Err(Error::Unauthorized);
+            }
+            self.tax_compliance_contract = contract;
+            Ok(())
+        }
+
         /// Sign approval with optional ECDSA cryptographic signature verification.
         /// When `signed_approval` is `Some`, the contract verifies the ECDSA signature
         /// and checks the recovered key matches the caller's registered public key.
@@ -942,10 +978,35 @@ mod propchain_escrow {
                     escrow.buyer
                 };
 
+                // ── Tax Withholding ──────────────────────────────────────────
+                let mut final_transfer_amount = escrow.deposited_amount;
+                if release_to_seller {
+                    if let Some(tax_contract) = self.tax_compliance_contract {
+                        use ink::env::call::FromAccountId;
+                        let mut withholder: ink::contract_ref!(TaxWithholder) =
+                            FromAccountId::from_account_id(tax_contract);
+
+                        let (withheld_amount, collector) = withholder.withhold_tax(
+                            escrow.property_id,
+                            escrow.jurisdiction,
+                            escrow.deposited_amount,
+                        );
+
+                        if withheld_amount > 0 {
+                            if self.env().transfer(collector, withheld_amount).is_err() {
+                                return Err(Error::InsufficientFunds);
+                            }
+                            final_transfer_amount =
+                                final_transfer_amount.saturating_sub(withheld_amount);
+                        }
+                    }
+                }
+                // ── End Tax Withholding ──────────────────────────────────────
+
                 // Transfer funds
                 if self
                     .env()
-                    .transfer(recipient, escrow.deposited_amount)
+                    .transfer(recipient, final_transfer_amount)
                     .is_err()
                 {
                     return Err(Error::InsufficientFunds);
@@ -1111,10 +1172,32 @@ mod propchain_escrow {
                     return Err(Error::Unauthorized);
                 }
 
+                // ── Tax Withholding ──────────────────────────────────────────
+                let mut final_transfer_amount = request.amount;
+                if let Some(tax_contract) = self.tax_compliance_contract {
+                    use ink::env::call::FromAccountId;
+                    let mut withholder: ink::contract_ref!(TaxWithholder) =
+                        FromAccountId::from_account_id(tax_contract);
+
+                    let (withheld_amount, collector) = withholder.withhold_tax(
+                        escrow.property_id,
+                        escrow.jurisdiction,
+                        request.amount,
+                    );
+
+                    if withheld_amount > 0 {
+                        if self.env().transfer(collector, withheld_amount).is_err() {
+                            return Err(Error::InsufficientFunds);
+                        }
+                        final_transfer_amount = final_transfer_amount.saturating_sub(withheld_amount);
+                    }
+                }
+                // ── End Tax Withholding ──────────────────────────────────────
+
                 // Perform the transfer
                 if self
                     .env()
-                    .transfer(request.recipient, request.amount)
+                    .transfer(request.recipient, final_transfer_amount)
                     .is_err()
                 {
                     return Err(Error::InsufficientFunds);
@@ -1581,7 +1664,7 @@ mod propchain_escrow {
 
     impl Default for AdvancedEscrow {
         fn default() -> Self {
-            Self::new(1_000_000_000_000) // Default threshold: 1 token
+            Self::new(1_000_000_000_000, None) // Default threshold: 1 token
         }
     }
 }

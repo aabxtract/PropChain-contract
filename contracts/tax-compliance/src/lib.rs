@@ -12,17 +12,6 @@ mod tax_compliance {
 
     const BASIS_POINTS_DENOMINATOR: Balance = 10_000;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
-    #[cfg_attr(
-        feature = "std",
-        derive(scale_info::TypeInfo, ink::storage::traits::StorageLayout)
-    )]
-    pub struct Jurisdiction {
-        pub code: u32,
-        pub country_code: [u8; 2],
-        pub region_code: u16,
-        pub locality_code: u16,
-    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, scale::Encode, scale::Decode)]
     #[cfg_attr(
@@ -59,6 +48,8 @@ mod tax_compliance {
         pub penalty_basis_points: u32,
         pub requires_reporting: bool,
         pub requires_legal_documents: bool,
+        pub withholding_rate_basis_points: u32,
+        pub tax_collector: AccountId,
         pub active: bool,
     }
 
@@ -340,6 +331,16 @@ mod tax_compliance {
         document_type: DocumentType,
         ipfs_hash: [u8; 32],
         uploaded_by: AccountId,
+    }
+
+    #[ink(event)]
+    pub struct TaxWithheld {
+        #[ink(topic)]
+        pub property_id: u64,
+        #[ink(topic)]
+        pub jurisdiction_code: u32,
+        pub amount: Balance,
+        pub collector: AccountId,
     }
 
     #[ink(event)]
@@ -1327,6 +1328,52 @@ mod tax_compliance {
         }
     }
 
+    impl TaxWithholder for TaxComplianceModule {
+        #[ink(message)]
+        fn withhold_tax(
+            &mut self,
+            property_id: u64,
+            jurisdiction: Jurisdiction,
+            transaction_amount: u128,
+        ) -> (u128, AccountId) {
+            let rule = match self.get_active_rule(jurisdiction.code) {
+                Ok(r) => r,
+                Err(_) => return (0, AccountId::from([0x00; 32])),
+            };
+
+            if rule.withholding_rate_basis_points == 0 {
+                return (0, rule.tax_collector);
+            }
+
+            let withheld_amount = (transaction_amount
+                .saturating_mul(rule.withholding_rate_basis_points as u128))
+                / BASIS_POINTS_DENOMINATOR as u128;
+
+            if withheld_amount > 0 {
+                let now = self.env().block_timestamp();
+                let period = self.reporting_period(now, rule.reporting_frequency);
+
+                self.env().emit_event(TaxWithheld {
+                    property_id,
+                    jurisdiction_code: jurisdiction.code,
+                    amount: withheld_amount,
+                    collector: rule.tax_collector,
+                });
+
+                self.log_audit(
+                    property_id,
+                    jurisdiction.code,
+                    period,
+                    AuditAction::TaxPaid,
+                    withheld_amount,
+                    [0u8; 32],
+                );
+            }
+
+            (withheld_amount, rule.tax_collector)
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1350,6 +1397,8 @@ mod tax_compliance {
                 penalty_basis_points: 500,
                 requires_reporting: true,
                 requires_legal_documents: true,
+                withholding_rate_basis_points: 500, // 5%
+                tax_collector: AccountId::from([0x01; 32]),
                 active: true,
             }
         }
