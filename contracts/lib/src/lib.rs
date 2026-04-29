@@ -190,7 +190,14 @@ pub mod propchain_contracts {
 
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
+
+        /// Circuit breaker configuration for external calls
+        external_call_config: CircuitBreakerConfig,
+
+        /// Circuit breaker states for each external dependency
+        external_call_breakers: Mapping<ExternalDependency, CircuitBreakerState>,
     }
+
 
     /// Escrow information
     #[derive(
