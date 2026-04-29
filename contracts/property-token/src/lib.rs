@@ -112,14 +112,6 @@ pub mod property_token {
         /// Custom URI overrides for tokens
         token_uris: Mapping<TokenId, String>,
 
-        /// Staking state
-        share_stakes: Mapping<(AccountId, TokenId), ShareStakeInfo>,
-        share_total_staked: Mapping<TokenId, u128>,
-        share_reward_pool: Mapping<TokenId, u128>,
-        share_reward_rate_bps: Mapping<TokenId, u128>,
-        share_acc_reward_per_share: Mapping<TokenId, u128>,
-        share_last_reward_block: Mapping<TokenId, u64>,
-
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
         /// Snapshot functionality for governance voting (Issue #194)

@@ -985,10 +985,14 @@ mod tax_compliance {
                     verified_at: None,
                 };
 
-                self.tax_documents
-                    .insert((property_id, jurisdiction_code, reporting_period, count), &document);
-                self.tax_document_count
-                    .insert((property_id, jurisdiction_code, reporting_period), &(count + 1));
+                self.tax_documents.insert(
+                    (property_id, jurisdiction_code, reporting_period, count),
+                    &document,
+                );
+                self.tax_document_count.insert(
+                    (property_id, jurisdiction_code, reporting_period),
+                    &(count + 1),
+                );
 
                 self.env().emit_event(TaxDocumentUploaded {
                     property_id,
@@ -1026,7 +1030,12 @@ mod tax_compliance {
                 let now = self.env().block_timestamp();
                 let caller = self.env().caller();
 
-                let key = (property_id, jurisdiction_code, reporting_period, document_index);
+                let key = (
+                    property_id,
+                    jurisdiction_code,
+                    reporting_period,
+                    document_index,
+                );
                 let mut document = self.tax_documents.get(key).ok_or(Error::RecordNotFound)?;
 
                 document.verified = true;
@@ -1069,9 +1078,9 @@ mod tax_compliance {
                 .unwrap_or(0);
             let mut documents = Vec::new();
             for i in 0..count {
-                if let Some(doc) = self
-                    .tax_documents
-                    .get((property_id, jurisdiction_code, reporting_period, i))
+                if let Some(doc) =
+                    self.tax_documents
+                        .get((property_id, jurisdiction_code, reporting_period, i))
                 {
                     documents.push(doc);
                 }
@@ -1087,8 +1096,12 @@ mod tax_compliance {
             reporting_period: u64,
             document_index: u64,
         ) -> Option<TaxDocument> {
-            self.tax_documents
-                .get((property_id, jurisdiction_code, reporting_period, document_index))
+            self.tax_documents.get((
+                property_id,
+                jurisdiction_code,
+                reporting_period,
+                document_index,
+            ))
         }
 
         // ===== Tax Advisor Integration - Issue #265 =====

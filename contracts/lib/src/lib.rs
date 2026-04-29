@@ -196,6 +196,10 @@ pub mod propchain_contracts {
 
         /// Reentrancy protection guard
         reentrancy_guard: ReentrancyGuard,
+        /// Circuit breaker configuration for external calls
+        external_call_config: CircuitBreakerConfig,
+        /// Circuit breaker states per external dependency
+        external_call_breakers: Mapping<ExternalDependency, CircuitBreakerState>,
     }
 
     #[derive(
@@ -609,6 +613,79 @@ pub mod propchain_contracts {
         pub total_items_failed: u64,
         pub total_early_terminations: u64,
         pub largest_batch_processed: u32,
+    }
+
+    // =========================================================================
+    // CIRCUIT BREAKER TYPES
+    // =========================================================================
+
+    /// Identifies an external contract dependency that can be circuit-broken
+    #[derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub enum ExternalDependency {
+        Oracle,
+        ComplianceRegistry,
+        FeeManager,
+        IdentityRegistry,
+    }
+
+    /// Per-dependency circuit breaker runtime state
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        Default,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerState {
+        /// Consecutive failures since last reset
+        pub failure_count: u8,
+        /// Lifetime failure counter
+        pub total_failures: u64,
+        /// Timestamp of the most recent failure
+        pub last_failure_at: Option<u64>,
+        /// If set, the circuit is open until this timestamp
+        pub open_until: Option<u64>,
+    }
+
+    /// Static configuration for the circuit breaker
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        scale::Encode,
+        scale::Decode,
+        ink::storage::traits::StorageLayout,
+    )]
+    #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+    pub struct CircuitBreakerConfig {
+        /// Number of consecutive failures before opening the circuit
+        pub failure_threshold: u8,
+        /// How long (in seconds) the circuit stays open before allowing retries
+        pub cooldown_period_secs: u64,
+    }
+
+    impl Default for CircuitBreakerConfig {
+        fn default() -> Self {
+            Self {
+                failure_threshold: 3,
+                cooldown_period_secs: 300,
+            }
+        }
     }
 
     /// Badge types for property verification
@@ -1343,6 +1420,8 @@ pub mod propchain_contracts {
                 cached_analytics: CachedAnalytics::default(),
                 load_metrics: LoadMetrics::default(),
                 reentrancy_guard: ReentrancyGuard::new(),
+                external_call_config: CircuitBreakerConfig::default(),
+                external_call_breakers: Mapping::default(),
             };
 
             // Emit contract initialization event
@@ -1711,6 +1790,7 @@ pub mod propchain_contracts {
         /// Update property valuation using the oracle
         #[ink(message)]
         pub fn update_valuation_from_oracle(&mut self, property_id: u64) -> Result<(), Error> {
+            self.ensure_dependency_available(ExternalDependency::Oracle)?;
             non_reentrant!(self, {
                 self.ensure_dependency_available(ExternalDependency::Oracle)?;
                 let oracle_addr = self.oracle.ok_or(Error::OracleError)?;
@@ -1729,12 +1809,7 @@ pub mod propchain_contracts {
                     }
                 };
 
-                // Update the property's recorded valuation in its metadata
-                if let Some(mut property) = self.properties.get(&property_id) {
-                    property.metadata.valuation = valuation.valuation;
-                    self.properties.insert(&property_id, &property);
-                } else {
-                    return Err(Error::PropertyNotFound);
+                    Ok(())
                 }
 
                 self.record_dependency_success(ExternalDependency::Oracle);
