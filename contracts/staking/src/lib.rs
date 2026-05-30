@@ -107,6 +107,13 @@ mod staking {
         pub support: bool,
         pub weight: u128,
     }
+    #[ink(event)]
+    pub struct EarlyWithdrawal {
+    #[ink(topic)]
+    pub staker: AccountId,
+    pub amount_returned: u128,
+    pub penalty: u128,
+}
 
     #[ink(event)]
     pub struct ParamProposalExecuted {
@@ -152,6 +159,7 @@ mod staking {
         param_votes: Mapping<(u64, AccountId), bool>,
         voting_period_blocks: u64,
         quorum_bps: u32,
+        early_withdrawal_penalty_bps: u128,
     }
 
     // =========================================================================
@@ -191,6 +199,7 @@ mod staking {
                 param_votes: Mapping::default(),
                 voting_period_blocks: DEFAULT_VOTING_PERIOD_BLOCKS,
                 quorum_bps: DEFAULT_QUORUM_BPS,
+                early_withdrawal_penalty_bps: constants::DEFAULT_EARLY_WITHDRAWAL_PENALTY_BPS,
             }
         }
 
@@ -292,39 +301,85 @@ mod staking {
             Ok(())
         }
 
-        /// Unstake tokens. Fails if the lock period is still active.
+       /// Unstake tokens. If called before the lock period expires, a penalty
+/// of `early_withdrawal_penalty_bps` is deducted from the returned amount.
+/// The penalty amount is retained in the reward pool. 
         #[ink(message)]
         pub fn unstake(&mut self) -> Result<(), Error> {
-            propchain_traits::non_reentrant!(self, {
-                let caller = self.env().caller();
-                let stake = self.stakes.get(caller).ok_or(Error::StakeNotFound)?;
+             propchain_traits::non_reentrant!(self, {
+        let caller = self.env().caller();
+        let stake = self.stakes.get(caller).ok_or(Error::StakeNotFound)?;
 
-                let now = self.env().block_number() as u64;
-                if now < stake.lock_until {
-                    return Err(Error::LockActive);
-                }
+        let now = self.env().block_number() as u64;
+        let amount = stake.amount;
+        let is_early = now < stake.lock_until;
 
-                let amount = stake.amount;
+        // Calculate penalty for early withdrawal (zero for on-time or flexible)
+        let penalty = if is_early && stake.lock_period != LockPeriod::Flexible {
+            amount
+                .saturating_mul(self.early_withdrawal_penalty_bps)
+                .saturating_div(constants::BASIS_POINTS_DENOMINATOR as u128)
+        } else {
+            0
+        };
 
-                // Remove governance power
-                self.remove_governance_power(&stake);
+        let amount_returned = amount.saturating_sub(penalty);
 
-                self.stakes.remove(caller);
-                self.total_staked = self.total_staked.saturating_sub(amount);
+        // Remove governance power
+        self.remove_governance_power(&stake);
 
-                // Remove from staker list
-                if let Some(pos) = self.staker_list.iter().position(|s| *s == caller) {
-                    self.staker_list.swap_remove(pos);
-                }
+        self.stakes.remove(caller);
+        self.total_staked = self.total_staked.saturating_sub(amount);
 
-                self.env().emit_event(Unstaked {
-                    staker: caller,
-                    amount,
-                });
-
-                Ok(())
-            })
+        // Penalty stays in the reward pool to benefit remaining stakers
+        if penalty > 0 {
+            self.reward_pool = self.reward_pool.saturating_add(penalty);
         }
+
+        // Remove from staker list
+        if let Some(pos) = self.staker_list.iter().position(|s| *s == caller) {
+            self.staker_list.swap_remove(pos);
+        }
+
+        if is_early && stake.lock_period != LockPeriod::Flexible {
+            self.env().emit_event(EarlyWithdrawal {
+                staker: caller,
+                amount_returned,
+                penalty,
+            });
+        } else {
+            self.env().emit_event(Unstaked {
+                staker: caller,
+                amount,
+            });
+        }
+
+        Ok(())
+    })
+        }
+        /// Update the early withdrawal penalty rate. Admin only.
+/// `penalty_bps` must not exceed `MAX_EARLY_WITHDRAWAL_PENALTY_BPS`.
+///
+#[ink(message)]
+pub fn set_early_withdrawal_penalty(
+    &mut self,
+    penalty_bps: u128,
+) -> Result<(), Error> {
+    if self.env().caller() != self.admin {
+        return Err(Error::Unauthorized);
+    }
+    if penalty_bps > constants::MAX_EARLY_WITHDRAWAL_PENALTY_BPS {
+        return Err(Error::InvalidConfig);
+    }
+    self.early_withdrawal_penalty_bps = penalty_bps;
+    Ok(())
+}
+
+/// Get the current early withdrawal penalty rate in basis points.
+#[ink(message)]
+pub fn get_early_withdrawal_penalty_bps(&self) -> u128 {
+    self.early_withdrawal_penalty_bps
+}
 
         /// Claim accumulated rewards.
         #[ink(message)]

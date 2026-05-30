@@ -561,6 +561,85 @@ mod tests {
     }
 
     #[ink::test]
+  
+#[ink::test]
+fn early_withdrawal_applies_penalty() {
+    let mut staking = create_staking();
+    let accounts = default_accounts();
+    set_caller(accounts.bob);
+
+    staking.stake(10_000_000_000_000, LockPeriod::ThirtyDays).unwrap();
+
+    // Unstake immediately — lock not expired, penalty should apply
+    assert!(staking.unstake().is_ok());
+
+    assert_eq!(staking.get_total_staked(), 0);
+    // 10% of 10_000_000_000_000 = 1_000_000_000_000 went to reward pool
+    assert!(staking.get_reward_pool() >= 1_000_000_000_000);
+}
+
+#[ink::test]
+fn flexible_lock_no_penalty_on_early_unstake() {
+    let mut staking = create_staking();
+    let accounts = default_accounts();
+    set_caller(accounts.bob);
+
+    staking.stake(10_000_000_000_000, LockPeriod::Flexible).unwrap();
+
+    let pool_before = staking.get_reward_pool();
+    assert!(staking.unstake().is_ok());
+    assert_eq!(staking.get_total_staked(), 0);
+    // No penalty for flexible
+    assert_eq!(staking.get_reward_pool(), pool_before);
+}
+
+#[ink::test]
+fn no_penalty_after_lock_expires() {
+    let mut staking = create_staking();
+    let accounts = default_accounts();
+    set_caller(accounts.bob);
+
+    staking.stake(10_000_000_000_000, LockPeriod::ThirtyDays).unwrap();
+
+    // Advance past the 30-day lock period
+    advance_block(constants::LOCK_PERIOD_30_DAYS as u32 + 1);
+
+    let pool_before = staking.get_reward_pool();
+    assert!(staking.unstake().is_ok());
+    // Reward pool unchanged — no penalty after expiry
+    assert_eq!(staking.get_reward_pool(), pool_before);
+}
+
+#[ink::test]
+fn set_early_withdrawal_penalty_admin_only() {
+    let mut staking = create_staking();
+    let accounts = default_accounts();
+
+    // Admin (alice) can update
+    assert!(staking.set_early_withdrawal_penalty(500).is_ok());
+    assert_eq!(staking.get_early_withdrawal_penalty_bps(), 500);
+
+    // Non-admin cannot
+    set_caller(accounts.bob);
+    assert_eq!(
+        staking.set_early_withdrawal_penalty(200),
+        Err(Error::Unauthorized)
+    );
+}
+
+#[ink::test]
+fn set_early_withdrawal_penalty_max_cap() {
+    let mut staking = create_staking();
+
+    // Above 50% cap is rejected
+    assert_eq!(
+        staking.set_early_withdrawal_penalty(6_000),
+        Err(Error::InvalidConfig)
+    );
+
+    // Exactly at cap is fine
+    assert!(staking.set_early_withdrawal_penalty(5_000).is_ok());
+}
     fn staking_tiers_applied_correctly() {
         let mut staking = create_staking();
         let accounts = default_accounts();
