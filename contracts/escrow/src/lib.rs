@@ -348,6 +348,19 @@ mod propchain_escrow {
             self.audit_logs
                 .insert(&escrow_id, &Vec::<AuditEntry>::new());
 
+            // Track analytics
+            self.analytics.total_created += 1;
+            self.analytics.total_volume = self.analytics.total_volume.saturating_add(amount);
+            self.analytics.total_active += 1;
+            self.analytics.average_escrow_amount = self.analytics.total_volume / self.analytics.total_created as u128;
+            // Track unique participants
+            for participant in &[buyer, seller] {
+                if !self.analytics_participants.get(participant).unwrap_or(false) {
+                    self.analytics_participants.insert(participant, &true);
+                    self.analytics.unique_participants += 1;
+                }
+            }
+
             // Add audit entry
             self.add_audit_entry(
                 escrow_id,
@@ -537,6 +550,11 @@ mod propchain_escrow {
                 updated_escrow.status = EscrowStatus::Released;
                 self.escrows.insert(&escrow_id, &updated_escrow);
 
+                // Track analytics
+                self.analytics.total_released += 1;
+                self.analytics.total_active = self.analytics.total_active.saturating_sub(1);
+                self.analytics.total_released_volume = self.analytics.total_released_volume.saturating_add(escrow.deposited_amount);
+
                 // Add audit entry
                 self.add_audit_entry(
                     escrow_id,
@@ -684,6 +702,10 @@ mod propchain_escrow {
                 let mut updated_escrow = escrow.clone();
                 updated_escrow.status = EscrowStatus::Refunded;
                 self.escrows.insert(&escrow_id, &updated_escrow);
+
+                // Track analytics
+                self.analytics.total_refunded += 1;
+                self.analytics.total_active = self.analytics.total_active.saturating_sub(1);
 
                 // Add audit entry
                 self.add_audit_entry(
@@ -1036,6 +1058,9 @@ mod propchain_escrow {
 
             self.disputes.insert(&escrow_id, &dispute);
 
+            // Track analytics
+            self.analytics.total_disputed += 1;
+
             // Update escrow status
             let mut updated_escrow = escrow;
             updated_escrow.status = EscrowStatus::Disputed;
@@ -1069,6 +1094,15 @@ mod propchain_escrow {
             }
 
             let mut dispute = self.disputes.get(&escrow_id).ok_or(Error::EscrowNotFound)?;
+            // Track resolution time (using block_timestamp consistently)
+            let resolution_time = self.env().block_timestamp().saturating_sub(dispute.raised_at);
+            let total_resolved = self.analytics.total_disputes_resolved;
+            let old_avg = self.analytics.average_dispute_resolution_time;
+            self.analytics.average_dispute_resolution_time =
+                (old_avg.saturating_mul(total_resolved).saturating_add(resolution_time))
+                    / (total_resolved + 1);
+            self.analytics.total_disputes_resolved += 1;
+
             dispute.resolved = true;
             dispute.resolution = Some(resolution.clone());
             self.disputes.insert(&escrow_id, &dispute);
