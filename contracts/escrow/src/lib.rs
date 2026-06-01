@@ -68,6 +68,18 @@ mod propchain_escrow {
         very_large_transfer_threshold: u128,
         /// Tax compliance contract address
         tax_compliance_contract: Option<AccountId>,
+
+        // ── Escrow Participant Rating (Issue #216) ───────────────────────────
+        /// All ratings given: (rated_participant, rating_id) -> ParticipantRating
+        ratings: Mapping<(AccountId, u64), ParticipantRating>,
+        /// Rating counter per participant
+        rating_counters: Mapping<AccountId, u64>,
+        /// Escrow ratings: escrow_id -> Vec<ParticipantRating>
+        escrow_ratings: Mapping<u64, Vec<ParticipantRating>>,
+        /// Ratings given by a rater: (rater, rating_id) -> bool
+        rater_ratings: Mapping<(AccountId, u64), bool>,
+        /// Rater rating counter
+        rater_rating_counter: u64,
     }
 
     // Events
@@ -217,6 +229,21 @@ mod propchain_escrow {
         pub cancelled_by: AccountId,
     }
 
+    // ── Rating Events (Issue #216) ───────────────────────────────────────────
+
+    /// Emitted when a participant rates another participant after an escrow.
+    #[ink(event)]
+    pub struct ParticipantRated {
+        #[ink(topic)]
+        escrow_id: u64,
+        #[ink(topic)]
+        rater: AccountId,
+        #[ink(topic)]
+        participant: AccountId,
+        score: u8,
+        rating_id: u64,
+    }
+
     impl AdvancedEscrow {
         /// Constructor
         #[ink(constructor)]
@@ -244,6 +271,12 @@ mod propchain_escrow {
                 large_transfer_threshold: 0,
                 very_large_transfer_threshold: 0,
                 tax_compliance_contract,
+                // Rating defaults (Issue #216)
+                ratings: Mapping::default(),
+                rating_counters: Mapping::default(),
+                escrow_ratings: Mapping::default(),
+                rater_ratings: Mapping::default(),
+                rater_rating_counter: 0,
             }
         }
 
@@ -1517,6 +1550,186 @@ mod propchain_escrow {
         #[ink(message)]
         pub fn get_high_value_threshold(&self) -> u128 {
             self.min_high_value_threshold
+        }
+
+        // ── Rating Messages (Issue #216) ─────────────────────────────────────
+
+        /// Rate a participant after an escrow transaction.
+        ///
+        /// Only the buyer or seller of a completed (Released/Refunded) escrow
+        /// can rate their counterparty. Score must be 1-5.
+        #[ink(message)]
+        pub fn rate_participant(
+            &mut self,
+            escrow_id: u64,
+            participant: AccountId,
+            score: u8,
+            comment: Option<String>,
+        ) -> Result<u64, Error> {
+            let caller = self.env().caller();
+            let escrow = self.escrows.get(&escrow_id).ok_or(Error::EscrowNotFound)?;
+
+            // Only released or refunded escrows can be rated
+            if escrow.status != EscrowStatus::Released && escrow.status != EscrowStatus::Refunded {
+                return Err(Error::InvalidStatus);
+            }
+
+            // Only buyer or seller can rate
+            if caller != escrow.buyer && caller != escrow.seller {
+                return Err(Error::Unauthorized);
+            }
+
+            // Can only rate the counterparty
+            if caller == escrow.buyer && participant != escrow.seller {
+                return Err(Error::Unauthorized);
+            }
+            if caller == escrow.seller && participant != escrow.buyer {
+                return Err(Error::Unauthorized);
+            }
+
+            // Validate score
+            if score < 1 || score > 5 {
+                return Err(Error::InvalidConfiguration);
+            }
+
+            // Generate rating ID
+            let mut rating_counter = self.rating_counters.get(&participant).unwrap_or(0);
+            rating_counter += 1;
+            self.rating_counters.insert(&participant, &rating_counter);
+
+            let rating = ParticipantRating {
+                participant,
+                rater: caller,
+                escrow_id,
+                score,
+                comment,
+                rated_at: self.env().block_timestamp(),
+            };
+
+            // Store rating
+            self.ratings.insert(&(participant, rating_counter), &rating);
+
+            // Track escrow ratings
+            let mut e_ratings = self.escrow_ratings.get(&escrow_id).unwrap_or_default();
+            e_ratings.push(rating);
+            self.escrow_ratings.insert(&escrow_id, &e_ratings);
+
+            // Track rater
+            self.rater_rating_counter += 1;
+            self.rater_ratings
+                .insert(&(caller, self.rater_rating_counter), &true);
+
+            // Add audit entry
+            self.add_audit_entry(
+                escrow_id,
+                caller,
+                "ParticipantRated".to_string(),
+                format!("Participant: {:?}, Score: {}", participant, score),
+            );
+
+            self.env().emit_event(ParticipantRated {
+                escrow_id,
+                rater: caller,
+                participant,
+                score,
+                rating_id: rating_counter,
+            });
+
+            Ok(rating_counter)
+        }
+
+        /// Get a specific rating for a participant.
+        #[ink(message)]
+        pub fn get_rating(&self, participant: AccountId, rating_id: u64) -> Option<ParticipantRating> {
+            self.ratings.get(&(participant, rating_id))
+        }
+
+        /// Get all ratings for a participant (paginated).
+        #[ink(message)]
+        pub fn get_participant_ratings(
+            &self,
+            participant: AccountId,
+            offset: u32,
+            limit: u32,
+        ) -> Vec<ParticipantRating> {
+            let total = self.rating_counters.get(&participant).unwrap_or(0);
+            let start = (offset as u64).saturating_add(1);
+            let end = total.saturating_sub(offset as u64);
+            let count = limit as u64;
+
+            let mut results = Vec::new();
+            let mut remaining = count;
+            let mut id = end;
+            while remaining > 0 && id > 0 {
+                if let Some(rating) = self.ratings.get(&(participant, id)) {
+                    results.push(rating);
+                    remaining -= 1;
+                }
+                id -= 1;
+            }
+            results
+        }
+
+        /// Get aggregated rating summary for a participant.
+        #[ink(message)]
+        pub fn get_participant_rating_summary(&self, participant: AccountId) -> RatingSummary {
+            let total = self.rating_counters.get(&participant).unwrap_or(0);
+            if total == 0 {
+                return RatingSummary {
+                    total_ratings: 0,
+                    average_score_bps: 0,
+                    score_distribution: [0; 5],
+                    transactions_as_buyer: 0,
+                    transactions_as_seller: 0,
+                    reliability_score: 0,
+                };
+            }
+
+            let mut total_score: u64 = 0;
+            let mut distribution = [0u32; 5];
+
+            for id in 1..=total {
+                if let Some(rating) = self.ratings.get(&(participant, id)) {
+                    let idx = (rating.score.saturating_sub(1)) as usize;
+                    if idx < 5 {
+                        distribution[idx] += 1;
+                    }
+                    total_score += rating.score as u64;
+                }
+            }
+
+            let average_score_bps = (total_score * 1000 / total as u64) as u32;
+
+            // Calculate reliability score (0-1000) based on rating consistency
+            let weighted_avg = total_score as f64 / total as f64;
+            let variance: f64 = {
+                let mut sum_sq = 0.0;
+                for id in 1..=total {
+                    if let Some(rating) = self.ratings.get(&(participant, id)) {
+                        let diff = rating.score as f64 - weighted_avg;
+                        sum_sq += diff * diff;
+                    }
+                }
+                sum_sq / total as f64
+            };
+            let std_dev = variance.sqrt();
+            // Lower std dev = more reliable. Score: 1000 - (std_dev * 200)
+            let reliability_score = (1000u32).saturating_sub((std_dev * 200.0) as u32);
+
+            RatingSummary {
+                total_ratings: total as u32,
+                average_score_bps,
+                score_distribution: distribution,
+                transactions_as_buyer: 0, // Would need on-chain tracking
+                transactions_as_seller: 0, // Would need on-chain tracking
+                reliability_score,
+            }
+        }
+
+        /// Get ratings for a specific escrow.
+        #[ink(message)]
+        pub fn get_escrow_ratings(&self, escrow_id: u64) -> Vec<ParticipantRating> {
+            self.escrow_ratings.get(&escrow_id).unwrap_or_default()
         }
 
         // Helper functions

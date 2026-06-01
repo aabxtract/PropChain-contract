@@ -161,3 +161,44 @@ pub struct LargeTransferRequest {
     /// Current status.
     pub status: LargeTransferStatus,
 }
+
+// ── Escrow Participant Rating Types (Issue #216) ────────────────────────────
+
+/// Rating score given to a participant in an escrow transaction.
+/// Score range: 1 (worst) to 5 (best).
+#[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+#[derive(ink::storage::traits::StorageLayout)]
+pub struct ParticipantRating {
+    /// The account that received the rating
+    pub participant: AccountId,
+    /// The account that gave the rating
+    pub rater: AccountId,
+    /// The escrow this rating is for
+    pub escrow_id: u64,
+    /// Rating score (1-5)
+    pub score: u8,
+    /// Optional comment
+    pub comment: Option<String>,
+    /// Block timestamp when rating was given
+    pub rated_at: u64,
+}
+
+/// Aggregated rating summary for a participant.
+#[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+#[derive(ink::storage::traits::StorageLayout)]
+pub struct RatingSummary {
+    /// Total number of ratings received
+    pub total_ratings: u32,
+    /// Average score (in basis points, e.g. 450 = 4.5)
+    pub average_score_bps: u32,
+    /// Breakdown: count per score (index 0 = score 1, index 4 = score 5)
+    pub score_distribution: [u32; 5],
+    /// Number of transactions completed as buyer
+    pub transactions_as_buyer: u32,
+    /// Number of transactions completed as seller
+    pub transactions_as_seller: u32,
+    /// Reliability score (0-1000) based on rating consistency
+    pub reliability_score: u32,
+}
