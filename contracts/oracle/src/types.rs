@@ -21,68 +21,57 @@ pub struct OracleBatchItemFailure {
     pub error: OracleError,
 }
 
-// ── Fallback Oracle Types (Issue #220) ──────────────────────────────────────
+// ── Oracle Governance Types (Issue #228) ──────────────────────────────────────
 
-/// Configuration for the oracle fallback mechanism.
+/// Actions that can be governed by oracle governance proposals.
 #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-#[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
-pub struct FallbackConfig {
-    /// Whether fallback is enabled
-    pub enabled: bool,
-    /// Delay in blocks before fallback is triggered
-    pub fallback_delay_blocks: u32,
-    /// Max number of fallback attempts per request
-    pub max_fallback_attempts: u32,
-    /// Whether to prefer the fallback source with the lowest latency
-    pub prefer_lowest_latency: bool,
+pub enum GovernanceAction {
+    /// Update the minimum stake required for oracle sources
+    UpdateMinStake(u128),
+    /// Update the minimum number of sources required for valuation
+    UpdateMinSources(u32),
+    /// Update the maximum staleness for price feeds
+    UpdateMaxStaleness(u64),
+    /// Update the volatility threshold for circuit breaker
+    UpdateVolatilityThreshold(u32),
+    /// Add a new oracle source type
+    AddSourceType(String, u32),
+    /// Remove an oracle source
+    RemoveSource(String),
 }
 
-impl Default for FallbackConfig {
+/// Governance-controlled oracle parameters.
+#[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
+#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
+pub struct GovernanceParams {
+    pub min_oracle_stake: u128,
+    pub max_sources: u32,
+    pub governance_quorum_bps: u32,
+    pub governance_voting_period_blocks: u64,
+}
+
+impl Default for GovernanceParams {
     fn default() -> Self {
         Self {
-            enabled: true,
-            fallback_delay_blocks: 2,
-            max_fallback_attempts: 3,
-            prefer_lowest_latency: true,
+            min_oracle_stake: 1_000_000,
+            max_sources: 20,
+            governance_quorum_bps: 5000, // 50%
+            governance_voting_period_blocks: 28_800, // ~2 days at 6s blocks
         }
     }
 }
 
-/// A fallback oracle source configuration.
+/// A governance proposal for changing oracle parameters.
 #[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
 #[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-#[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
-pub struct FallbackSource {
-    /// Unique identifier for this fallback source
-    pub id: String,
-    /// Priority order (lower = higher priority)
-    pub priority: u32,
-    /// Whether this fallback source is currently active
-    pub active: bool,
-    /// Estimated latency in milliseconds
-    pub estimated_latency_ms: u32,
-    /// Number of successful queries through this source
-    pub success_count: u64,
-    /// Number of failed queries through this source
-    pub failure_count: u64,
-}
-
-/// Result from a fallback query.
-#[derive(Debug, Clone, PartialEq, Eq, scale::Encode, scale::Decode)]
-#[cfg_attr(feature = "std", derive(scale_info::TypeInfo))]
-#[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
-pub struct FallbackQueryResult {
-    /// Whether the query succeeded
-    pub success: bool,
-    /// The price returned (0 if failed)
-    pub price: u128,
-    /// Which fallback source served the data
-    pub source_id: String,
-    /// Number of fallback attempts made
-    pub attempts: u32,
-    /// Timestamp of the result
-    pub timestamp: u64,
-    /// Error message if failed
-    pub error: String,
+pub struct GovernanceProposal {
+    pub id: u64,
+    pub proposer: AccountId,
+    pub action: GovernanceAction,
+    pub votes_for: u128,
+    pub votes_against: u128,
+    pub voting_end: u64,
+    pub executed: bool,
+    pub created_at: u64,
 }
