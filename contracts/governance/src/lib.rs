@@ -68,6 +68,18 @@ mod governance {
         pub new_threshold: u32,
     }
 
+    // ── Discussion Forum Event (Issue #233) ─────────────────────────────────
+
+    #[ink(event)]
+    pub struct CommentAdded {
+        #[ink(topic)]
+        pub proposal_id: u64,
+        #[ink(topic)]
+        pub author: AccountId,
+        pub discussion_id: u64,
+        pub parent_id: Option<u64>,
+    }
+
     #[ink(event)]
     pub struct EmergencyOverrideUsed {
         #[ink(topic)]
@@ -355,6 +367,12 @@ mod governance {
                 active_proposals: active,
                 avg_participation_bps,
             }
+        }
+
+        /// Returns all comments for a proposal.
+        #[ink(message)]
+        pub fn get_proposal_comments(&self, proposal_id: u64) -> Vec<DiscussionComment> {
+            self.proposal_comments.get(&proposal_id).unwrap_or_default()
         }
 
         /// Returns the participation rate for a specific proposal in basis points.
