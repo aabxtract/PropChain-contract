@@ -977,8 +977,8 @@ mod propchain_escrow {
             }
 
             let mut dispute = self.disputes.get(&escrow_id).ok_or(Error::EscrowNotFound)?;
-            // Track resolution time in blocks
-            let resolution_time = self.env().block_number().saturating_sub(dispute.raised_at);
+            // Track resolution time (using block_timestamp consistently)
+            let resolution_time = self.env().block_timestamp().saturating_sub(dispute.raised_at);
             let total_resolved = self.analytics.total_disputes_resolved;
             let old_avg = self.analytics.average_dispute_resolution_time;
             self.analytics.average_dispute_resolution_time =
